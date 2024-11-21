@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "main": "index.js",
   "license": "MIT",
+  "type": "module",
   "dependencies": {
     "@shopify/shopify-api": "^11.5.0",
     "@types/socket.io": "^3.0.2",
