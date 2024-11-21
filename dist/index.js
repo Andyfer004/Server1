@@ -1,11 +1,11 @@
-import express from 'express';
-import cors from 'cors';
-import dotenv from 'dotenv';
-import helmet from 'helmet';
-import morgan from 'morgan';
-import compression from 'compression';
-import rateLimit from 'express-rate-limit';
-import chatbotRoutes from './routes/chatbot'; // Importa las rutas del chatbot
+const express = require('express');
+const cors = require('cors');
+const dotenv = require('dotenv');
+const helmet = require('helmet');
+const morgan = require('morgan');
+const compression = require('compression');
+const rateLimit = require('express-rate-limit');
+const chatbotRoutes = require('./routes/chatbot'); // Importa las rutas del chatbot
 
 dotenv.config();
 
