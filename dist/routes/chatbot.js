@@ -74,7 +74,7 @@ const chatHandler = async (req, res, next) => {
                     // Enviar respuesta a WhatsApp
                     await twilioClient.messages.create({
                         body: aiMessage,
-                        from: "whatsapp:+14155238886",
+                        from: "whatsapp:+18178131389",
                         to: userPhoneNumber,
                     });
 
