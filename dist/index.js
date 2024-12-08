@@ -44,7 +44,7 @@ app.use((err, req, res, next) => {
 });
 
 // Configuración del puerto
-const PORT = process.env.PORT || 4000;
+const PORT = process.env.PORT || 8080;
 
 // Iniciar el servidor
 app.listen(PORT, () => {
