@@ -1,50 +1,33 @@
 const express = require('express');
 const openai = require('./openai'); // API de OpenAI
+const { PrismaClient } = require('@prisma/client'); // Prisma Client
 const twilio = require('twilio');
-const { Pool } = require('pg'); // Cliente de PostgreSQL
 
 const chatbotRoutes = express.Router();
-const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+const prisma = new PrismaClient(); // Inicializa Prisma
 
-// Configura el cliente de PostgreSQL
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: {
-        rejectUnauthorized: false, // Para conexiones seguras
-    },
-});
+const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
 /**
  * Obtiene o crea un threadId para un número de teléfono
  */
 async function getOrCreateThreadId(phoneNumber) {
-    try {
-        // Buscar thread por número de teléfono
-        const result = await pool.query(
-            'SELECT thread_id FROM threads WHERE phone_number = $1 LIMIT 1',
-            [phoneNumber]
-        );
+    let thread = await prisma.thread.findUnique({
+        where: { phoneNumber },
+    });
 
-        if (result.rows.length > 0) {
-            // Si existe, devuelve el threadId
-            return result.rows[0].thread_id;
-        }
-
-        // Si no existe, crea un nuevo thread en OpenAI
+    if (!thread) {
+        // Crea un nuevo thread en OpenAI y guárdalo
         const newThread = await openai.beta.threads.create();
-        const threadId = newThread.id;
-
-        // Inserta el nuevo thread en la base de datos
-        await pool.query(
-            'INSERT INTO threads (phone_number, thread_id) VALUES ($1, $2)',
-            [phoneNumber, threadId]
-        );
-
-        return threadId;
-    } catch (error) {
-        console.error('Error en getOrCreateThreadId:', error);
-        throw error;
+        thread = await prisma.thread.create({
+            data: {
+                phoneNumber,
+                threadId: newThread.id,
+            },
+        });
     }
+
+    return thread.threadId;
 }
 
 /**
@@ -52,8 +35,8 @@ async function getOrCreateThreadId(phoneNumber) {
  */
 const chatHandler = async (req, res, next) => {
     try {
-        const userMessage = req.body.Body;
-        const userPhoneNumber = req.body.From;
+        const userMessage = req.body.Body; // Twilio envía el mensaje en 'Body'
+        const userPhoneNumber = req.body.From; // Twilio envía el número del usuario en 'From'
 
         if (!userMessage || !userPhoneNumber) {
             res.status(400).json({ error: "Faltan datos en la solicitud." });
@@ -62,8 +45,10 @@ const chatHandler = async (req, res, next) => {
 
         console.log(`Mensaje recibido de ${userPhoneNumber}: ${userMessage}`);
 
+        // Obtén o crea un threadId para este número de teléfono
         const threadId = await getOrCreateThreadId(userPhoneNumber);
 
+        // Crear mensaje en el thread
         const message = await openai.beta.threads.messages.create(threadId, {
             role: "user",
             content: userMessage.trim(),
@@ -79,6 +64,7 @@ const chatHandler = async (req, res, next) => {
             const threadMessages = await openai.beta.threads.messages.list(threadId);
             const aiMessage = extractAssistantMessage(threadMessages);
 
+            // Enviar respuesta a WhatsApp
             await twilioClient.messages.create({
                 body: aiMessage,
                 from: "whatsapp:+18178131389",
