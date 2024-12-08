@@ -33,11 +33,11 @@ async function getOrCreateThreadId(phoneNumber) {
 /**
  * Maneja la conversación del chatbot
  */
-const messageBuffer = {}; // Almacena mensajes y temporizadores por número de teléfono
+const messageQueue = {}; // Cola para acumular mensajes por número de teléfono
 
 const chatHandler = async (req, res, next) => {
     try {
-        const userMessage = req.body.Body.trim();
+        const userMessage = req.body.Body;
         const userPhoneNumber = req.body.From;
 
         if (!userMessage || !userPhoneNumber) {
@@ -47,60 +47,62 @@ const chatHandler = async (req, res, next) => {
 
         console.log(`Mensaje recibido de ${userPhoneNumber}: ${userMessage}`);
 
-        // Si no hay un buffer para el número, inicialízalo
-        if (!messageBuffer[userPhoneNumber]) {
-            messageBuffer[userPhoneNumber] = { messages: [], timer: null };
+        // Agregar el mensaje a la cola
+        if (!messageQueue[userPhoneNumber]) {
+            messageQueue[userPhoneNumber] = {
+                timer: null,
+                messages: [],
+            };
         }
 
-        // Agrega el mensaje al buffer
-        messageBuffer[userPhoneNumber].messages.push(userMessage);
+        messageQueue[userPhoneNumber].messages.push(userMessage.trim());
 
-        // Reinicia el temporizador
-        if (messageBuffer[userPhoneNumber].timer) {
-            clearTimeout(messageBuffer[userPhoneNumber].timer);
+        // Reiniciar el temporizador
+        if (messageQueue[userPhoneNumber].timer) {
+            clearTimeout(messageQueue[userPhoneNumber].timer);
         }
 
-        messageBuffer[userPhoneNumber].timer = setTimeout(async () => {
-            try {
-                const threadId = await getOrCreateThreadId(userPhoneNumber);
-                const contextMessages = messageBuffer[userPhoneNumber].messages.join('\n');
+        messageQueue[userPhoneNumber].timer = setTimeout(async () => {
+            // Concatenar mensajes
+            const concatenatedMessage = messageQueue[userPhoneNumber].messages.join(' ');
+            console.log(`Mensajes concatenados de ${userPhoneNumber}: ${concatenatedMessage}`);
 
-                // Crear un mensaje en el thread con todo el contexto
-                await openai.beta.threads.messages.create(threadId, {
-                    role: "user",
-                    content: contextMessages,
+            // Limpieza de la cola
+            messageQueue[userPhoneNumber].messages = [];
+            delete messageQueue[userPhoneNumber].timer;
+
+            // Continuar con el flujo original
+            const threadId = await getOrCreateThreadId(userPhoneNumber);
+
+            const message = await openai.beta.threads.messages.create(threadId, {
+                role: "user",
+                content: concatenatedMessage,
+            });
+
+            let run = await openai.beta.threads.runs.create(threadId, {
+                assistant_id: "asst_UFGyAkWkTwdknKwF7PEsZOod",
+            });
+
+            run = await handleRun(threadId, run.id);
+
+            if (run.status === "completed") {
+                const threadMessages = await openai.beta.threads.messages.list(threadId);
+                const aiMessage = extractAssistantMessage(threadMessages);
+
+                // Enviar respuesta a WhatsApp
+                await twilioClient.messages.create({
+                    body: aiMessage,
+                    from: "whatsapp:+18178131389",
+                    to: userPhoneNumber,
                 });
 
-                let run = await openai.beta.threads.runs.create(threadId, {
-                    assistant_id: "asst_UFGyAkWkTwdknKwF7PEsZOod",
-                });
-
-                run = await handleRun(threadId, run.id);
-
-                if (run.status === "completed") {
-                    const threadMessages = await openai.beta.threads.messages.list(threadId);
-                    const aiMessage = extractAssistantMessage(threadMessages);
-
-                    // Enviar respuesta a WhatsApp
-                    await twilioClient.messages.create({
-                        body: aiMessage,
-                        from: "whatsapp:+18178131389",
-                        to: userPhoneNumber,
-                    });
-
-                    console.log(`Respuesta enviada a ${userPhoneNumber}: ${aiMessage}`);
-                } else {
-                    console.error(`El run no se completó para ${userPhoneNumber}`);
-                }
-
-                // Limpia el buffer
-                delete messageBuffer[userPhoneNumber];
-            } catch (error) {
-                console.error("Error procesando los mensajes:", error);
+                console.log(`Respuesta enviada a ${userPhoneNumber}: ${aiMessage}`);
+            } else {
+                console.error(`El run no se completó para ${userPhoneNumber}`);
             }
-        }, 10000); // Espera 10 segundos de inactividad
+        }, 10000); // Espera de 10 segundos
 
-        res.status(200).send("Mensaje recibido.");
+        res.status(200).send("Mensaje recibido y en espera para procesar.");
     } catch (error) {
         console.error("Error en el chatHandler:", error);
         next(error);
