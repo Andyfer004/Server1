@@ -9,10 +9,10 @@
     "@types/socket.io": "^3.0.2",
     "axios": "^1.7.7",
     "body-parser": "^1.20.3",
-    "compression": "^1.7.4",
+    "compression": "^1.7.5",
     "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.21.1",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
     "express-async-handler": "^1.2.0",
     "express-rate-limit": "^7.4.1",
     "graphql": "^16.9.0",
@@ -20,10 +20,11 @@
     "helmet": "^8.0.0",
     "isomorphic-fetch": "^3.0.0",
     "morgan": "^1.10.0",
-    "openai": "^4.67.1",
+    "openai": "^4.76.0",
+    "pg": "^8.13.1",
     "react": "^18.3.1",
     "socket.io": "^4.8.0",
-    "twilio": "^5.3.5"
+    "twilio": "^5.3.7"
   },
   "devDependencies": {
     "@graphql-codegen/cli": "^5.0.3",
