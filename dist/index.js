@@ -5,7 +5,6 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
-const serverless = require('serverless-http'); // Importa serverless-http para compatibilidad con Vercel
 const chatbotRoutes = require('./routes/chatbot'); // Importa las rutas del chatbot
 
 dotenv.config();
@@ -44,14 +43,10 @@ app.use((err, req, res, next) => {
     res.status(500).send('¡Algo salió mal!');
 });
 
-// Configuración del puerto para desarrollo local
-if (process.env.NODE_ENV !== 'production') {
-    const PORT = process.env.PORT || 4000;
-    app.listen(PORT, () => {
-        console.log(`El servidor está corriendo en el puerto ${PORT}`);
-    });
-}
+// Configuración del puerto
+const PORT = process.env.PORT || 4000;
 
-// Exportar la app como una función serverless para Vercel
-module.exports = app;
-module.exports.handler = serverless(app);
+// Iniciar el servidor
+app.listen(PORT, () => {
+    console.log(`El servidor está corriendo en el puerto ${PORT}`);
+});
