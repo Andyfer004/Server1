@@ -39,8 +39,7 @@ const chatHandler = async (req, res, next) => {
         const userPhoneNumber = req.body.From; // Twilio envía el número del usuario en 'From'
 
         if (!userMessage || !userPhoneNumber) {
-            res.status(400).json({ error: "Faltan datos en la solicitud." });
-            return;
+            return res.status(400).json({ error: "Faltan datos en la solicitud." });
         }
 
         console.log(`Mensaje recibido de ${userPhoneNumber}: ${userMessage}`);
@@ -58,6 +57,7 @@ const chatHandler = async (req, res, next) => {
             assistant_id: "asst_UFGyAkWkTwdknKwF7PEsZOod",
         });
 
+        // Manejar el run
         run = await handleRun(threadId, run.id);
 
         if (run.status === "completed") {
@@ -72,16 +72,19 @@ const chatHandler = async (req, res, next) => {
             });
 
             console.log(`Respuesta enviada a ${userPhoneNumber}: ${aiMessage}`);
+
+            // Responder a Twilio con un texto plano
+            return res.set('Content-Type', 'text/plain').send("Mensaje recibido y procesado correctamente.");
         } else {
             console.error(`El run no se completó para ${userPhoneNumber}`);
+            return res.status(500).json({ error: "El asistente no pudo completar el run." });
         }
-
-        res.status(200).send("Mensaje recibido.");
     } catch (error) {
         console.error("Error en el chatHandler:", error);
-        next(error);
+        return res.status(500).json({ error: "Error interno en el servidor." });
     }
 };
+
 
 /**
  * Manejar el estado del run (threads, herramientas, etc.)
@@ -99,7 +102,7 @@ async function handleRun(threadId, runId, timeout = 30000, interval = 1000) {
             if (requiredAction.type === 'submit_tool_outputs') {
                 await handleSubmitToolOutputs(threadId, runId, requiredAction);
             } else {
-                throw new Error(`Tipo de acción requerida no manejada: ${requiredAction.type}`);
+                console.warn(`Acción requerida no manejada: ${requiredAction.type}`);
             }
         } else if (runStatus.status === 'failed') {
             throw new Error('El run falló');
@@ -110,6 +113,7 @@ async function handleRun(threadId, runId, timeout = 30000, interval = 1000) {
 
     throw new Error('El run excedió el tiempo de espera');
 }
+
 
 /**
  * Manejar herramientas requeridas (e.g., tools)
@@ -144,9 +148,11 @@ async function handleSubmitToolOutputs(threadId, runId, requiredAction) {
  */
 function extractAssistantMessage(threadMessages) {
     const messages = threadMessages.data.filter((msg) => msg.role === 'assistant');
-    return messages.length > 0
-        ? messages[0].content[0]?.text?.value || 'No hay respuesta del asistente'
-        : 'No se encontró respuesta del asistente';
+    if (messages.length === 0) {
+        console.warn("No se encontró ningún mensaje del asistente.");
+        return "El asistente no generó una respuesta.";
+    }
+    return messages[0]?.content || "Respuesta vacía del asistente.";
 }
 
 // Rutas principales
@@ -154,6 +160,12 @@ chatbotRoutes.get('/test', async (req, res) => {
     res.json({ message: "¡Hola, mundo!" });
 });
 
-chatbotRoutes.post('/chat', chatHandler);
+chatbotRoutes.post('/chat', chatHandler, (req, res) => {
+    const twiml = new twilio.twiml.MessagingResponse();
+    twiml.message('Gracias por tu mensaje, estamos procesando tu solicitud.');
+    res.set('Content-Type', 'text/xml');
+    res.send(twiml.toString());
+});
+
 
 module.exports = chatbotRoutes;
