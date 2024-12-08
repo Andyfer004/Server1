@@ -1,0 +1,8 @@
+/api
+/prisma/migrations
+/src
+/codegen.ts
+/tsconfig.json
+/vercel.json
+/netlify.toml
+/README.md
