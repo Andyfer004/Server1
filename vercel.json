@@ -4,6 +4,6 @@
     { "src": "/dist/index.js", "use": "@vercel/node" }
   ],
   "routes": [
-    { "src": "/dist/chatbot/(.*)", "dest": "/dist/index.js" }
+    { "src": "/dist/routes/(.*)", "dest": "/dist/index.js" }
   ]
 }
