@@ -33,10 +33,12 @@ async function getOrCreateThreadId(phoneNumber) {
 /**
  * Maneja la conversación del chatbot
  */
+const messageBuffer = {}; // Almacena mensajes y temporizadores por número de teléfono
+
 const chatHandler = async (req, res, next) => {
     try {
-        const userMessage = req.body.Body; // Twilio envía el mensaje en 'Body'
-        const userPhoneNumber = req.body.From; // Twilio envía el número del usuario en 'From'
+        const userMessage = req.body.Body.trim();
+        const userPhoneNumber = req.body.From;
 
         if (!userMessage || !userPhoneNumber) {
             res.status(400).json({ error: "Faltan datos en la solicitud." });
@@ -45,36 +47,58 @@ const chatHandler = async (req, res, next) => {
 
         console.log(`Mensaje recibido de ${userPhoneNumber}: ${userMessage}`);
 
-        // Obtén o crea un threadId para este número de teléfono
-        const threadId = await getOrCreateThreadId(userPhoneNumber);
-
-        // Crear mensaje en el thread
-        const message = await openai.beta.threads.messages.create(threadId, {
-            role: "user",
-            content: userMessage.trim(),
-        });
-
-        let run = await openai.beta.threads.runs.create(threadId, {
-            assistant_id: "asst_UFGyAkWkTwdknKwF7PEsZOod",
-        });
-
-        run = await handleRun(threadId, run.id);
-
-        if (run.status === "completed") {
-            const threadMessages = await openai.beta.threads.messages.list(threadId);
-            const aiMessage = extractAssistantMessage(threadMessages);
-
-            // Enviar respuesta a WhatsApp
-            await twilioClient.messages.create({
-                body: aiMessage,
-                from: "whatsapp:+18178131389",
-                to: userPhoneNumber,
-            });
-
-            console.log(`Respuesta enviada a ${userPhoneNumber}: ${aiMessage}`);
-        } else {
-            console.error(`El run no se completó para ${userPhoneNumber}`);
+        // Si no hay un buffer para el número, inicialízalo
+        if (!messageBuffer[userPhoneNumber]) {
+            messageBuffer[userPhoneNumber] = { messages: [], timer: null };
         }
+
+        // Agrega el mensaje al buffer
+        messageBuffer[userPhoneNumber].messages.push(userMessage);
+
+        // Reinicia el temporizador
+        if (messageBuffer[userPhoneNumber].timer) {
+            clearTimeout(messageBuffer[userPhoneNumber].timer);
+        }
+
+        messageBuffer[userPhoneNumber].timer = setTimeout(async () => {
+            try {
+                const threadId = await getOrCreateThreadId(userPhoneNumber);
+                const contextMessages = messageBuffer[userPhoneNumber].messages.join('\n');
+
+                // Crear un mensaje en el thread con todo el contexto
+                await openai.beta.threads.messages.create(threadId, {
+                    role: "user",
+                    content: contextMessages,
+                });
+
+                let run = await openai.beta.threads.runs.create(threadId, {
+                    assistant_id: "asst_UFGyAkWkTwdknKwF7PEsZOod",
+                });
+
+                run = await handleRun(threadId, run.id);
+
+                if (run.status === "completed") {
+                    const threadMessages = await openai.beta.threads.messages.list(threadId);
+                    const aiMessage = extractAssistantMessage(threadMessages);
+
+                    // Enviar respuesta a WhatsApp
+                    await twilioClient.messages.create({
+                        body: aiMessage,
+                        from: "whatsapp:+18178131389",
+                        to: userPhoneNumber,
+                    });
+
+                    console.log(`Respuesta enviada a ${userPhoneNumber}: ${aiMessage}`);
+                } else {
+                    console.error(`El run no se completó para ${userPhoneNumber}`);
+                }
+
+                // Limpia el buffer
+                delete messageBuffer[userPhoneNumber];
+            } catch (error) {
+                console.error("Error procesando los mensajes:", error);
+            }
+        }, 10000); // Espera 10 segundos de inactividad
 
         res.status(200).send("Mensaje recibido.");
     } catch (error) {
@@ -82,6 +106,7 @@ const chatHandler = async (req, res, next) => {
         next(error);
     }
 };
+
 
 /**
  * Manejar el estado del run (threads, herramientas, etc.)
