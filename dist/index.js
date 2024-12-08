@@ -18,7 +18,7 @@ app.use(helmet());
 app.use(cors());
 
 // Middleware para registrar las solicitudes HTTP
-app.use(morgan('combined'));
+app.use(morgan('dev')); // Formato 'dev' para logs detallados
 
 // Middleware para comprimir las respuestas
 app.use(compression());
@@ -26,7 +26,7 @@ app.use(compression());
 // Middleware para limitar las solicitudes
 const limiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutos
-    max: 100, // limita a 100 solicitudes por IP
+    max: 100, // Limita a 100 solicitudes por IP
 });
 app.use(limiter);
 
@@ -34,13 +34,51 @@ app.use(limiter);
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
+// Middleware para registrar todas las solicitudes y respuestas
+app.use((req, res, next) => {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+    next();
+});
+
 // Usar las rutas del chatbot
 app.use('/api/chatbot', chatbotRoutes);
 
+// Middleware para capturar errores en rutas del chatbot
+app.use('/api/chatbot', (err, req, res, next) => {
+    console.error('Error en las rutas del chatbot:', {
+        message: err.message,
+        stack: err.stack,
+        route: req.originalUrl,
+    });
+    next(err); // Pasa el error al manejador global
+});
+
 // Middleware para manejo de errores
 app.use((err, req, res, next) => {
-    console.error(err.stack);
-    res.status(500).send('¡Algo salió mal!');
+    console.error('Error detectado:', {
+        message: err.message,
+        stack: err.stack,
+        status: err.status || 500,
+        route: req.originalUrl,
+    });
+
+    res.status(err.status || 500).json({
+        message: err.message || '¡Algo salió mal!',
+        error: process.env.NODE_ENV === 'development' ? err : {}, // Muestra detalles solo en desarrollo
+    });
+});
+
+// Manejadores globales para excepciones y promesas no manejadas
+process.on('uncaughtException', (err) => {
+    console.error('Excepción no controlada:', err);
+    process.exit(1); // Opcional: Finaliza el proceso en caso de errores fatales
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('Promesa no manejada:', {
+        promise,
+        reason,
+    });
 });
 
 // Configuración del puerto
