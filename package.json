@@ -4,6 +4,7 @@
   "main": "index.js",
   "license": "MIT",
   "dependencies": {
+    "@prisma/client": "^6.0.1",
     "@shopify/shopify-api": "^11.5.0",
     "@types/socket.io": "^3.0.2",
     "axios": "^1.7.7",
