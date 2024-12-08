@@ -1,93 +1,81 @@
 const express = require('express');
 const openai = require('./openai'); // API de OpenAI
-const { tools } = require('./tools'); // Herramientas integradas (Shopify, etc.)
+const { PrismaClient } = require('@prisma/client'); // Prisma Client
 const twilio = require('twilio');
 
 const chatbotRoutes = express.Router();
+const prisma = new PrismaClient(); // Inicializa Prisma
 
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-// Cola para almacenar los mensajes de cada usuario
-const messageQueue = {};
+/**
+ * Obtiene o crea un threadId para un número de teléfono
+ */
+async function getOrCreateThreadId(phoneNumber) {
+    let thread = await prisma.thread.findUnique({
+        where: { phoneNumber },
+    });
+
+    if (!thread) {
+        // Crea un nuevo thread en OpenAI y guárdalo
+        const newThread = await openai.beta.threads.create();
+        thread = await prisma.thread.create({
+            data: {
+                phoneNumber,
+                threadId: newThread.id,
+            },
+        });
+    }
+
+    return thread.threadId;
+}
 
 /**
- * Función principal del chatbot con temporizador
+ * Maneja la conversación del chatbot
  */
 const chatHandler = async (req, res, next) => {
     try {
-        const user_message = req.body.Body; // Twilio envía el mensaje en 'Body'
+        const userMessage = req.body.Body; // Twilio envía el mensaje en 'Body'
         const userPhoneNumber = req.body.From; // Twilio envía el número del usuario en 'From'
 
-        if (!user_message || !userPhoneNumber) {
+        if (!userMessage || !userPhoneNumber) {
             res.status(400).json({ error: "Faltan datos en la solicitud." });
             return;
         }
 
-        console.log(`Mensaje recibido de ${userPhoneNumber}: ${user_message}`);
+        console.log(`Mensaje recibido de ${userPhoneNumber}: ${userMessage}`);
 
-        // Inicializa la cola del usuario si no existe
-        if (!messageQueue[userPhoneNumber]) {
-            messageQueue[userPhoneNumber] = { messages: [], timer: null };
+        // Obtén o crea un threadId para este número de teléfono
+        const threadId = await getOrCreateThreadId(userPhoneNumber);
+
+        // Crear mensaje en el thread
+        const message = await openai.beta.threads.messages.create(threadId, {
+            role: "user",
+            content: userMessage.trim(),
+        });
+
+        let run = await openai.beta.threads.runs.create(threadId, {
+            assistant_id: "asst_UFGyAkWkTwdknKwF7PEsZOod",
+        });
+
+        run = await handleRun(threadId, run.id);
+
+        if (run.status === "completed") {
+            const threadMessages = await openai.beta.threads.messages.list(threadId);
+            const aiMessage = extractAssistantMessage(threadMessages);
+
+            // Enviar respuesta a WhatsApp
+            await twilioClient.messages.create({
+                body: aiMessage,
+                from: "whatsapp:+18178131389",
+                to: userPhoneNumber,
+            });
+
+            console.log(`Respuesta enviada a ${userPhoneNumber}: ${aiMessage}`);
+        } else {
+            console.error(`El run no se completó para ${userPhoneNumber}`);
         }
 
-        // Agrega el mensaje recibido a la cola
-        messageQueue[userPhoneNumber].messages.push(user_message);
-
-        // Reinicia el temporizador si ya existe
-        if (messageQueue[userPhoneNumber].timer) {
-            clearTimeout(messageQueue[userPhoneNumber].timer);
-        }
-
-        // Configura un nuevo temporizador para procesar los mensajes
-        messageQueue[userPhoneNumber].timer = setTimeout(async () => {
-            try {
-                // Combina todos los mensajes del usuario en uno solo
-                const combinedMessage = messageQueue[userPhoneNumber].messages.join(" ");
-                console.log(`Procesando mensajes combinados de ${userPhoneNumber}: ${combinedMessage}`);
-
-                // Limpia la cola después de procesar
-                delete messageQueue[userPhoneNumber];
-
-                // Procesa el mensaje combinado con OpenAI
-                let threadId = req.body.thread_id;
-                if (!threadId) {
-                    const thread = await openai.beta.threads.create();
-                    threadId = thread.id;
-                }
-
-                // Crear mensaje en el thread
-                const message = await openai.beta.threads.messages.create(threadId, {
-                    role: "user",
-                    content: combinedMessage.trim(),
-                });
-
-                let run = await openai.beta.threads.runs.create(threadId, {
-                    assistant_id: "asst_UFGyAkWkTwdknKwF7PEsZOod",
-                });
-
-                run = await handleRun(threadId, run.id);
-
-                if (run.status === "completed") {
-                    const threadMessages = await openai.beta.threads.messages.list(threadId);
-                    const aiMessage = extractAssistantMessage(threadMessages);
-
-                    // Enviar respuesta a WhatsApp
-                    await twilioClient.messages.create({
-                        body: aiMessage,
-                        from: "whatsapp:+18178131389",
-                        to: userPhoneNumber,
-                    });
-
-                    console.log(`Respuesta enviada a ${userPhoneNumber}: ${aiMessage}`);
-                } else {
-                    console.error(`El run no se completó para ${userPhoneNumber}`);
-                }
-            } catch (error) {
-                console.error("Error procesando la cola de mensajes:", error);
-            }
-        }, 10000); // Tiempo de espera (10 segundos)
-
-        // Responde inmediatamente para confirmar recepción
         res.status(200).send("Mensaje recibido.");
     } catch (error) {
         console.error("Error en el chatHandler:", error);
@@ -124,7 +112,7 @@ async function handleRun(threadId, runId, timeout = 30000, interval = 1000) {
 }
 
 /**
- * Manejar acciones requeridas (e.g., tools)
+ * Manejar herramientas requeridas (e.g., tools)
  */
 async function handleSubmitToolOutputs(threadId, runId, requiredAction) {
     const submitToolOutputs = requiredAction.submit_tool_outputs;
@@ -137,19 +125,7 @@ async function handleSubmitToolOutputs(threadId, runId, requiredAction) {
         let toolOutputMessage;
 
         switch (functionName) {
-            case 'deliveryStatus':
-                toolOutputMessage = functionArguments
-                    ? await tools.deliveryStatus(JSON.parse(functionArguments).orderNumber)
-                    : 'Error: No se proporcionaron argumentos.';
-                break;
-            case 'catalogProducts':
-                toolOutputMessage = await tools.catalogProducts();
-                break;
-            case 'similarProducts':
-                toolOutputMessage = functionArguments
-                    ? await tools.similarProducts(JSON.parse(functionArguments).imageUrl)
-                    : 'Error: No se proporcionaron argumentos.';
-                break;
+            // Puedes agregar lógica adicional aquí para herramientas específicas
             default:
                 toolOutputMessage = 'Tool not recognized';
         }
