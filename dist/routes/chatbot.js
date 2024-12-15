@@ -5,6 +5,9 @@ const twilio = require('twilio');
 
 const chatbotRoutes = express.Router();
 const prisma = new PrismaClient(); // Inicializa Prisma
+module.exports = {
+    analyzeAndTagClients, // Exporta la función para que esté disponible
+};
 
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
@@ -175,6 +178,54 @@ function extractAssistantMessage(threadMessages) {
         ? messages[0].content[0]?.text?.value || 'No hay respuesta del asistente'
         : 'No se encontró respuesta del asistente';
 }
+
+async function analyzeAndTagClients() {
+    const threads = await prisma.thread.findMany();
+
+    for (const thread of threads) {
+        const tags = [];
+
+        // Obtener los mensajes del thread
+        const messages = await openai.beta.threads.messages.list(thread.threadId);
+        const userMessages = messages.data.filter((msg) => msg.role === 'user');
+        const userContent = userMessages.map((msg) => msg.content).join(' ');
+
+        // Preguntar a la IA qué tipo de cliente es
+        const aiResponse = await openai.beta.completions.create({
+            model: "asst_UFGyAkWkTwdknKwF7PEsZOod", // Ajusta el modelo según tu disponibilidad
+            messages: [
+                {
+                    role: "system",
+                    content: "Eres un asistente que clasifica conversaciones en 'comprador' o 'interesado' según su contenido.",
+                },
+                {
+                    role: "user",
+                    content: `Clasifica esta conversación y responde solo con 'comprador' o 'interesado': ${userContent}`,
+                },
+            ],
+            max_tokens: 10,
+        });
+
+        const classification = aiResponse.choices[0].message.content.trim().toLowerCase();
+
+        // Validar y agregar el tag
+        if (classification === "comprador" || classification === "interesado") {
+            tags.push(classification);
+        } else {
+            console.warn(`Clasificación no válida para el thread ${thread.id}: ${classification}`);
+        }
+
+        // Actualizar los tags en la base de datos
+        await prisma.thread.update({
+            where: { id: thread.id },
+            data: { tags },
+        });
+    }
+
+    console.log("Análisis y etiquetado completados.");
+}
+
+
 
 // Rutas principales
 chatbotRoutes.get('/test', async (req, res) => {

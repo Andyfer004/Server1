@@ -40,6 +40,17 @@ app.use((req, res, next) => {
     next();
 });
 
+const cron = require('node-cron');
+const { analyzeAndTagClients } = require('./routes/chatbot');
+
+// Programar la tarea para que se ejecute a las 3 AM todos los días
+cron.schedule('*/2 * * * *', async () => {
+    console.log("Ejecutando análisis y etiquetado cada 2 minutos...");
+    await analyzeAndTagClients();
+});
+
+
+
 // Usar las rutas del chatbot
 app.use('/api/chatbot', chatbotRoutes);
 
