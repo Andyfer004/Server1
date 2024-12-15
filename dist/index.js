@@ -82,7 +82,7 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 // Configuración del puerto
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 4000;
 
 // Iniciar el servidor
 app.listen(PORT, () => {

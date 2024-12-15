@@ -12,13 +12,4 @@ model Thread {
   phoneNumber String   @unique
   threadId    String
   createdAt   DateTime @default(now())
-  images      Image[]
-}
-
-model Image {
-  id          Int      @id @default(autoincrement())
-  url         String
-  threadId    Int
-  thread      Thread   @relation(fields: [threadId], references: [id])
-  createdAt   DateTime @default(now())
 }
