@@ -131,7 +131,12 @@ const chatHandler = async (req, res, next) => {
     }
 };
 
-
+function extractAssistantMessage(threadMessages) {
+    const messages = threadMessages.data.filter((msg) => msg.role === 'assistant');
+    return messages.length > 0
+        ? messages[0].content[0]?.text?.value || 'No hay respuesta del asistente'
+        : 'No se encontró respuesta del asistente';
+}
 /**
  * Manejar el estado del run (threads, herramientas, etc.)
  */
