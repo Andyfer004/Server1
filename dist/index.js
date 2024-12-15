@@ -5,8 +5,11 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
-const chatbotRoutes = require('./routes/chatbot'); 
+const openai = require('./routes/openai'); // API de OpenAI
+const { chatbotRoutes, analyzeAndTagClients, sendPromotionalMessage } = require('./routes/chatbot');
 
+const { PrismaClient } = require('@prisma/client');
+const prisma = new PrismaClient(); // Inicializa Prisma
 dotenv.config();
 
 const app = express();
@@ -41,14 +44,54 @@ app.use((req, res, next) => {
 });
 
 const cron = require('node-cron');
-const { analyzeAndTagClients } = require('./routes/chatbot');
 
-// Programar la tarea para que se ejecute a las 3 AM todos los días
-cron.schedule('*/2 * * * *', async () => {
-    console.log("Ejecutando análisis y etiquetado cada 2 minutos...");
-    await analyzeAndTagClients();
+// Programar la tarea para verificar los tags de clientes cada 24 horas (3 AM todos los días)
+cron.schedule('0 3 * * *', async () => {
+    console.log("Ejecutando análisis y etiquetado cada 24 horas...");
+    await analyzeAndTagClients(); // Analiza y etiqueta los clientes según las conversaciones
 });
 
+// Programar la tarea para enviar mensajes promocionales cada 36 horas
+cron.schedule('0 */36 * * *', async () => {
+    console.log("Enviando mensajes promocionales a clientes interesados...");
+
+    try {
+        // Buscar clientes interesados en la base de datos
+        const interestedClients = await prisma.thread.findMany({
+            where: {
+                tags: {
+                    has: "interesado", // Verifica clientes con la etiqueta "interesado"
+                },
+            },
+        });
+
+        console.log(`Clientes interesados encontrados: ${interestedClients.length}`);
+
+        for (const client of interestedClients) {
+            // Obtener los mensajes del asistente para este thread
+            const assistantResponse = await openai.beta.threads.messages.list(client.threadId);
+
+            // Extraer el último mensaje del asistente
+            const lastAssistantMessage = assistantResponse.data
+                .filter((msg) => msg.role === "assistant")
+                .pop()?.content;
+
+            // Construir el mensaje promocional
+            const promotionalMessage = `
+Hola, seguimos teniendo ofertas en base a tu interés:
+${typeof lastAssistantMessage === "string" ? lastAssistantMessage : "¡Tenemos increíbles ofertas para ti! Contáctanos para más información."}
+¡Esperamos poder ayudarte pronto!
+`;
+
+            console.log(`Enviando mensaje promocional a ${client.phoneNumber}:`, promotionalMessage);
+
+            // Enviar mensaje al cliente
+            await sendPromotionalMessage(client.phoneNumber, promotionalMessage);
+        }
+    } catch (error) {
+        console.error("Error enviando mensajes promocionales:", error);
+    }
+});
 
 
 // Usar las rutas del chatbot

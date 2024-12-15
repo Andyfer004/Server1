@@ -5,11 +5,30 @@ const twilio = require('twilio');
 
 const chatbotRoutes = express.Router();
 const prisma = new PrismaClient(); // Inicializa Prisma
-module.exports = {
-    analyzeAndTagClients, // Exporta la función para que esté disponible
-};
+
 
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+
+function formatPhoneNumberForWhatsApp(phoneNumber) {
+    const sanitizedNumber = phoneNumber.replace(/[^\d]/g, ""); // Elimina caracteres no numéricos
+    return `whatsapp:+${sanitizedNumber}`;
+}
+
+
+async function sendPromotionalMessage(phoneNumber, message) {
+    try {
+        const formattedNumber = formatPhoneNumberForWhatsApp(phoneNumber); // Formatea el número
+        await twilioClient.messages.create({
+            body: message,
+            from: "whatsapp:+18178131389", // Tu número de Twilio
+            to: formattedNumber,
+        });
+        console.log(`Mensaje promocional enviado a ${formattedNumber}`);
+    } catch (error) {
+        console.error(`Error al enviar mensaje a ${phoneNumber}:`, error);
+    }
+}
+
 
 /**
  * Obtiene o crea un threadId para un número de teléfono
@@ -169,61 +188,116 @@ async function handleSubmitToolOutputs(threadId, runId, requiredAction) {
     await openai.beta.threads.runs.submitToolOutputs(threadId, runId, { tool_outputs: toolOutputs });
 }
 
-/**
- * Extraer el mensaje del asistente
- */
-function extractAssistantMessage(threadMessages) {
-    const messages = threadMessages.data.filter((msg) => msg.role === 'assistant');
-    return messages.length > 0
-        ? messages[0].content[0]?.text?.value || 'No hay respuesta del asistente'
-        : 'No se encontró respuesta del asistente';
-}
-
 async function analyzeAndTagClients() {
+    console.log("Iniciando análisis de threads...");
+
+    const MAX_TOKENS = 4000; // Máximo seguro para gpt-3.5-turbo
     const threads = await prisma.thread.findMany();
+    console.log(`Threads encontrados: ${threads.length}`);
 
     for (const thread of threads) {
-        const tags = [];
+        console.log(`Analizando thread con phoneNumber: ${thread.phoneNumber}`);
 
-        // Obtener los mensajes del thread
-        const messages = await openai.beta.threads.messages.list(thread.threadId);
-        const userMessages = messages.data.filter((msg) => msg.role === 'user');
-        const userContent = userMessages.map((msg) => msg.content).join(' ');
+        try {
+            const tags = [];
+            const messages = await openai.beta.threads.messages.list(thread.threadId);
 
-        // Preguntar a la IA qué tipo de cliente es
-        const aiResponse = await openai.beta.completions.create({
-            model: "asst_UFGyAkWkTwdknKwF7PEsZOod", // Ajusta el modelo según tu disponibilidad
-            messages: [
-                {
-                    role: "system",
-                    content: "Eres un asistente que clasifica conversaciones en 'comprador' o 'interesado' según su contenido.",
-                },
-                {
-                    role: "user",
-                    content: `Clasifica esta conversación y responde solo con 'comprador' o 'interesado': ${userContent}`,
-                },
-            ],
-            max_tokens: 10,
-        });
+            // Obtener mensajes válidos
+            const userMessages = messages.data
+                .filter((msg) => typeof msg.content === "string")
+                .map((msg) => msg.content.trim());
 
-        const classification = aiResponse.choices[0].message.content.trim().toLowerCase();
+            console.log(`Mensajes totales encontrados: ${userMessages.length}`);
 
-        // Validar y agregar el tag
-        if (classification === "comprador" || classification === "interesado") {
-            tags.push(classification);
-        } else {
-            console.warn(`Clasificación no válida para el thread ${thread.id}: ${classification}`);
+            // Eliminar duplicados
+            const uniqueMessages = [...new Set(userMessages)];
+            console.log(`Mensajes únicos: ${uniqueMessages.length}`);
+
+            // Si no hay mensajes válidos, marcar como interesado y continuar
+            if (uniqueMessages.length === 0) {
+                console.log("No hay mensajes únicos válidos para procesar. Clasificando como 'interesado'.");
+                tags.push("interesado");
+                await prisma.thread.update({
+                    where: { id: thread.id },
+                    data: { tags, lastProcessedAt: new Date() },
+                });
+                console.log(`Thread actualizado con tags: ${tags}`);
+                continue;
+            }
+
+            // Combinar mensajes en un solo string
+            const allUserMessages = uniqueMessages.join(" ");
+            const limitedContent = truncateToMaxTokens(allUserMessages, MAX_TOKENS);
+
+            console.log(`Contenido final para el modelo: ${limitedContent.length} caracteres.`);
+
+            if (!limitedContent.trim()) {
+                console.log("El contenido final está vacío. Clasificando como 'interesado'.");
+                tags.push("interesado");
+                await prisma.thread.update({
+                    where: { id: thread.id },
+                    data: { tags, lastProcessedAt: new Date() },
+                });
+                console.log(`Thread actualizado con tags: ${tags}`);
+                continue;
+            }
+
+            // Crear prompt para clasificación
+            const prompt = `
+Eres un asistente que clasifica conversaciones. Clasifica al cliente como:
+- "comprador": si muestra intención de comprar.
+- "interesado": si muestra interés pero no confirma la compra.
+
+Historial:
+${limitedContent}
+
+Responde con "comprador", "interesado" o "indeterminado".`;
+
+            const response = await openai.chat.completions.create({
+                model: "gpt-3.5-turbo",
+                messages: [
+                    { role: "system", content: "Eres un asistente que clasifica conversaciones." },
+                    { role: "user", content: prompt },
+                ],
+                max_tokens: 10,
+            });
+
+            const classification = response.choices[0]?.message?.content?.trim().toLowerCase();
+
+            console.log(`Clasificación recibida: ${classification}`);
+
+            if (classification === "comprador" || classification === "interesado") {
+                tags.push(classification);
+            } else {
+                console.warn(`Clasificación no válida: ${classification}`);
+            }
+
+            // Actualizar los tags en la base de datos si hay alguno válido
+            if (tags.length > 0) {
+                await prisma.thread.update({
+                    where: { id: thread.id },
+                    data: { tags, lastProcessedAt: new Date() },
+                });
+                console.log(`Thread actualizado con tags: ${tags}`);
+            } else {
+                console.log("No se encontraron tags válidos para actualizar.");
+            }
+        } catch (error) {
+            console.error(`Error procesando el thread ${thread.id}:`, error);
         }
-
-        // Actualizar los tags en la base de datos
-        await prisma.thread.update({
-            where: { id: thread.id },
-            data: { tags },
-        });
     }
 
     console.log("Análisis y etiquetado completados.");
 }
+
+/**
+ * Trunca el texto para que no exceda el límite de tokens.
+ */
+function truncateToMaxTokens(content, maxTokens) {
+    const tokens = content.split(" "); // Aproximación simple para dividir en tokens
+    return tokens.length > maxTokens ? tokens.slice(-maxTokens).join(" ") : content;
+}
+
 
 
 
@@ -234,4 +308,8 @@ chatbotRoutes.get('/test', async (req, res) => {
 
 chatbotRoutes.post('/chat', chatHandler);
 
-module.exports = chatbotRoutes;
+module.exports = {
+    chatbotRoutes,
+    analyzeAndTagClients, // Asegúrate de que analyzeAndTagClients esté aquí.
+    sendPromotionalMessage,
+};
