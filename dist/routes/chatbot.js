@@ -39,70 +39,83 @@ const chatHandler = async (req, res, next) => {
     try {
         const userMessage = req.body.Body;
         const userPhoneNumber = req.body.From;
+        const numMedia = parseInt(req.body.NumMedia || "0", 10); // Número de archivos multimedia
+        const mediaUrls = [];
 
-        if (!userMessage || !userPhoneNumber) {
+        // Capturar URLs de imágenes enviadas
+        for (let i = 0; i < numMedia; i++) {
+            mediaUrls.push(req.body[`MediaUrl${i}`]);
+        }
+
+        console.log(`Mensaje recibido de ${userPhoneNumber}: ${userMessage}`);
+        console.log(`Imágenes recibidas: ${mediaUrls.join(", ")}`);
+
+        if (!userMessage && numMedia === 0) {
             res.status(400).json({ error: "Faltan datos en la solicitud." });
             return;
         }
 
-        console.log(`Mensaje recibido de ${userPhoneNumber}: ${userMessage}`);
+        // Obtener o crear el threadId
+        const threadId = await getOrCreateThreadId(userPhoneNumber);
 
-        // Agregar el mensaje a la cola
-        if (!messageQueue[userPhoneNumber]) {
-            messageQueue[userPhoneNumber] = {
-                timer: null,
-                messages: [],
-            };
-        }
-
-        messageQueue[userPhoneNumber].messages.push(userMessage.trim());
-
-        // Reiniciar el temporizador
-        if (messageQueue[userPhoneNumber].timer) {
-            clearTimeout(messageQueue[userPhoneNumber].timer);
-        }
-
-        messageQueue[userPhoneNumber].timer = setTimeout(async () => {
-            // Concatenar mensajes
-            const concatenatedMessage = messageQueue[userPhoneNumber].messages.join(' ');
-            console.log(`Mensajes concatenados de ${userPhoneNumber}: ${concatenatedMessage}`);
-
-            // Limpieza de la cola
-            messageQueue[userPhoneNumber].messages = [];
-            delete messageQueue[userPhoneNumber].timer;
-
-            // Continuar con el flujo original
-            const threadId = await getOrCreateThreadId(userPhoneNumber);
-
-            const message = await openai.beta.threads.messages.create(threadId, {
-                role: "user",
-                content: concatenatedMessage,
-            });
-
-            let run = await openai.beta.threads.runs.create(threadId, {
-                assistant_id: "asst_UFGyAkWkTwdknKwF7PEsZOod",
-            });
-
-            run = await handleRun(threadId, run.id);
-
-            if (run.status === "completed") {
-                const threadMessages = await openai.beta.threads.messages.list(threadId);
-                const aiMessage = extractAssistantMessage(threadMessages);
-
-                // Enviar respuesta a WhatsApp
-                await twilioClient.messages.create({
-                    body: aiMessage,
-                    from: "whatsapp:+18178131389",
-                    to: userPhoneNumber,
+        // Almacenar las imágenes en la base de datos (opcional)
+        if (mediaUrls.length > 0) {
+            for (const url of mediaUrls) {
+                await prisma.image.create({
+                    data: {
+                        url,
+                        threadId: threadId, // Asociar con el thread
+                    },
                 });
-
-                console.log(`Respuesta enviada a ${userPhoneNumber}: ${aiMessage}`);
-            } else {
-                console.error(`El run no se completó para ${userPhoneNumber}`);
             }
-        }, 10000); // Espera de 10 segundos
+        }
 
-        res.status(200).send("Mensaje recibido y en espera para procesar.");
+        // Enviar mensaje a OpenAI
+        const openaiMessages = [
+            {
+                role: "user",
+                content: userMessage || "Envié imágenes.",
+            },
+        ];
+
+        // Si hay imágenes, agrega referencias al mensaje
+        if (mediaUrls.length > 0) {
+            mediaUrls.forEach((url) => {
+                openaiMessages.push({
+                    role: "user",
+                    content: `Imagen enviada: ${url}`,
+                });
+            });
+        }
+
+        const message = await openai.beta.threads.messages.create(threadId, {
+            role: "user",
+            content: openaiMessages.map((msg) => msg.content).join("\n"),
+        });
+
+        let run = await openai.beta.threads.runs.create(threadId, {
+            assistant_id: "asst_UFGyAkWkTwdknKwF7PEsZOod",
+        });
+
+        run = await handleRun(threadId, run.id);
+
+        if (run.status === "completed") {
+            const threadMessages = await openai.beta.threads.messages.list(threadId);
+            const aiMessage = extractAssistantMessage(threadMessages);
+
+            // Enviar respuesta a WhatsApp
+            await twilioClient.messages.create({
+                body: aiMessage,
+                from: "whatsapp:+18178131389",
+                to: userPhoneNumber,
+            });
+
+            console.log(`Respuesta enviada a ${userPhoneNumber}: ${aiMessage}`);
+        } else {
+            console.error(`El run no se completó para ${userPhoneNumber}`);
+        }
+
+        res.status(200).send("Mensaje procesado con éxito.");
     } catch (error) {
         console.error("Error en el chatHandler:", error);
         next(error);

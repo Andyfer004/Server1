@@ -5,7 +5,7 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
-const chatbotRoutes = require('./routes/chatbot'); // Importa las rutas del chatbot
+const chatbotRoutes = require('./routes/chatbot'); 
 
 dotenv.config();
 
