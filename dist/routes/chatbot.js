@@ -6,14 +6,12 @@ const twilio = require('twilio');
 const chatbotRoutes = express.Router();
 const prisma = new PrismaClient(); // Inicializa Prisma
 
-
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
 function formatPhoneNumberForWhatsApp(phoneNumber) {
     const sanitizedNumber = phoneNumber.replace(/[^\d]/g, ""); // Elimina caracteres no numéricos
     return `whatsapp:+${sanitizedNumber}`;
 }
-
 
 async function sendPromotionalMessage(phoneNumber, message) {
     try {
@@ -28,7 +26,6 @@ async function sendPromotionalMessage(phoneNumber, message) {
         console.error(`Error al enviar mensaje a ${phoneNumber}:`, error);
     }
 }
-
 
 /**
  * Obtiene o crea un threadId para un número de teléfono
@@ -53,6 +50,30 @@ async function getOrCreateThreadId(phoneNumber) {
 }
 
 /**
+ * Función para obtener la descripción de una imagen mediante OpenAI
+ */
+async function describeImage(imageUrl) {
+    try {
+        const aiResponse = await openai.chat.completions.create({
+            model: "gpt-3.5-turbo",
+            messages: [
+                {
+                    role: "user",
+                    content: `Describe detalladamente el contenido de la siguiente imagen: ${imageUrl}`,
+                },
+            ],
+        });
+
+        const description = aiResponse.choices[0]?.message?.content?.trim();
+        if (!description) throw new Error("No se obtuvo una descripción válida de la imagen.");
+        return description;
+    } catch (error) {
+        console.error("Error al describir la imagen:", error);
+        throw new Error("No se pudo obtener la descripción de la imagen. Inténtalo más tarde.");
+    }
+}
+
+/**
  * Maneja la conversación del chatbot
  */
 const messageQueue = {}; // Cola para acumular mensajes por número de teléfono
@@ -69,7 +90,25 @@ const chatHandler = async (req, res, next) => {
 
         console.log(`Mensaje recibido de ${userPhoneNumber}: ${userMessage}`);
 
-        // Agregar el mensaje a la cola
+        let finalMessage = userMessage.trim();
+
+        // Detectar si el mensaje es una URL de imagen
+        const imageUrlRegex = /(https?:\/\/.*\.(?:png|jpg|jpeg|gif))/i;
+        const imageUrlMatch = finalMessage.match(imageUrlRegex);
+
+        if (imageUrlMatch) {
+            const imageUrl = imageUrlMatch[0];
+            console.log(`Se detectó una URL de imagen: ${imageUrl}`);
+
+            // Obtener la descripción de la imagen
+            const imageDescription = await describeImage(imageUrl);
+            console.log(`Descripción obtenida: ${imageDescription}`);
+
+            // Usar la descripción como el mensaje final
+            finalMessage = `Imagen detectada. Descripción: ${imageDescription}`;
+        }
+
+        // Agregar el mensaje (o descripción) a la cola
         if (!messageQueue[userPhoneNumber]) {
             messageQueue[userPhoneNumber] = {
                 timer: null,
@@ -77,7 +116,7 @@ const chatHandler = async (req, res, next) => {
             };
         }
 
-        messageQueue[userPhoneNumber].messages.push(userMessage.trim());
+        messageQueue[userPhoneNumber].messages.push(finalMessage);
 
         // Reiniciar el temporizador
         if (messageQueue[userPhoneNumber].timer) {
@@ -137,6 +176,7 @@ function extractAssistantMessage(threadMessages) {
         ? messages[0].content[0]?.text?.value || 'No hay respuesta del asistente'
         : 'No se encontró respuesta del asistente';
 }
+
 /**
  * Manejar el estado del run (threads, herramientas, etc.)
  */
@@ -302,9 +342,6 @@ function truncateToMaxTokens(content, maxTokens) {
     const tokens = content.split(" "); // Aproximación simple para dividir en tokens
     return tokens.length > maxTokens ? tokens.slice(-maxTokens).join(" ") : content;
 }
-
-
-
 
 // Rutas principales
 chatbotRoutes.get('/test', async (req, res) => {
