@@ -4,10 +4,9 @@
   "main": "index.js",
   "license": "MIT",
   "dependencies": {
-    "@prisma/client": "^6.0.1",
     "@shopify/shopify-api": "^11.5.0",
     "@types/socket.io": "^3.0.2",
-    "axios": "^1.7.7",
+    "axios": "^1.8.3",
     "body-parser": "^1.20.3",
     "compression": "^1.7.4",
     "cors": "^2.8.5",
@@ -30,6 +29,7 @@
     "@graphql-codegen/cli": "^5.0.3",
     "@graphql-codegen/client-preset": "^4.4.0",
     "@graphql-typed-document-node/core": "^3.2.0",
+    "@prisma/client": "^6.4.1",
     "@types/compression": "^1.7.5",
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",
@@ -37,6 +37,7 @@
     "@types/morgan": "^1.9.9",
     "@types/node": "^22.7.4",
     "nodemon": "^3.1.7",
+    "prisma": "^6.4.1",
     "ts-node": "^10.9.2",
     "typescript": "^5.6.3"
   },

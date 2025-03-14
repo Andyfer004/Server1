@@ -7,12 +7,21 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model Thread {
-  id               Int      @id @default(autoincrement())
-  phoneNumber      String   @unique
-  threadId         String
-  tags             String[] @default([])
-  lastProcessedAt  DateTime? // Campo opcional para rastrear el último procesamiento
-  createdAt        DateTime @default(now())
+model UserConversation {
+  id         String        @id @default(cuid())
+  phoneNumber String       @unique      // Usaremos el número de WhatsApp como identificador
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+  threadId   String?                     // (Opcional) para guardar el threadId de OpenAI si lo necesitas
+  messages   UserMessage[]
 }
 
+model UserMessage {
+  id             String           @id @default(cuid())
+  conversationId String
+  role           String           // "user" o "assistant"
+  content        String
+  mediaUrl       String?          // Almacena la URL de la imagen si existe
+  createdAt      DateTime         @default(now())
+  conversation   UserConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+}

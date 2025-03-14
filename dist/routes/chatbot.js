@@ -1,294 +1,404 @@
 const express = require('express');
 const openai = require('./openai'); // API de OpenAI
-const { PrismaClient } = require('@prisma/client'); // Prisma Client
+const { PrismaClient } = require('@prisma/client');
 const twilio = require('twilio');
 
 const chatbotRoutes = express.Router();
-const prisma = new PrismaClient(); // Inicializa Prisma
+const prisma = new PrismaClient();
 
 const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
 function formatPhoneNumberForWhatsApp(phoneNumber) {
-    const sanitizedNumber = phoneNumber.replace(/[^\d]/g, ""); // Elimina caracteres no numéricos
-    return `whatsapp:+${sanitizedNumber}`;
+  const sanitizedNumber = phoneNumber.replace(/[^\d]/g, ""); // Elimina caracteres no numéricos
+  return `whatsapp:+${sanitizedNumber}`;
 }
 
 async function sendPromotionalMessage(phoneNumber, message) {
-    try {
-        const formattedNumber = formatPhoneNumberForWhatsApp(phoneNumber); // Formatea el número
-        await twilioClient.messages.create({
-            body: message,
-            from: "whatsapp:+18178131389", // Tu número de Twilio
-            to: formattedNumber,
-        });
-        console.log(`Mensaje promocional enviado a ${formattedNumber}`);
-    } catch (error) {
-        console.error(`Error al enviar mensaje a ${phoneNumber}:`, error);
-    }
-}
-
-/**
- * Obtiene o crea un threadId para un número de teléfono
- */
-async function getOrCreateThreadId(phoneNumber) {
-    let thread = await prisma.thread.findUnique({
-        where: { phoneNumber },
+  try {
+    const formattedNumber = formatPhoneNumberForWhatsApp(phoneNumber);
+    await twilioClient.messages.create({
+      body: message,
+      from: "whatsapp:+18178131389",
+      to: formattedNumber,
     });
-
-    if (!thread) {
-        // Crea un nuevo thread en OpenAI y guárdalo
-        const newThread = await openai.beta.threads.create();
-        thread = await prisma.thread.create({
-            data: {
-                phoneNumber,
-                threadId: newThread.id,
-            },
-        });
-    }
-
-    return thread.threadId;
+    console.log(`Mensaje promocional enviado a ${formattedNumber}`);
+  } catch (error) {
+    console.error(`Error al enviar mensaje a ${phoneNumber}:`, error);
+  }
 }
 
 /**
- * Función para obtener la descripción de una imagen mediante OpenAI
+ * Obtiene o crea una conversación en la nueva tabla UserConversation.
+ */
+async function getOrCreateConversation(phoneNumber) {
+  let conversation = await prisma.userConversation.findUnique({
+    where: { phoneNumber },
+  });
+
+  if (!conversation) {
+    const newThread = await openai.beta.threads.create();
+    conversation = await prisma.userConversation.create({
+      data: {
+        phoneNumber,
+        threadId: newThread.id,
+      },
+    });
+  }
+
+  return conversation;
+}
+
+/**
+ * Función para obtener la descripción de una imagen mediante OpenAI.
  */
 async function describeImage(imageUrl) {
     try {
-        const aiResponse = await openai.chat.completions.create({
-            model: "gpt-3.5-turbo",
-            messages: [
-                {
-                    role: "user",
-                    content: `Describe detalladamente el contenido de la siguiente imagen: ${imageUrl}`,
-                },
+      console.log("📥 Descargando imagen desde:", imageUrl);
+      
+      // Crear el string de autenticación y codificarlo en base64.
+      const authString = `${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`;
+      const base64Auth = Buffer.from(authString).toString("base64");
+      
+      // Descargar la imagen usando las credenciales de Twilio.
+      const imageResponse = await fetch(imageUrl, {
+        method: "GET",
+        headers: {
+          "User-Agent": "Mozilla/5.0",
+          "Accept": "image/*",
+          "Authorization": `Basic ${base64Auth}`
+        },
+      });
+  
+      if (!imageResponse.ok) {
+        console.error("❌ No se pudo descargar la imagen:", imageResponse.status, imageResponse.statusText);
+        throw new Error("No se pudo descargar la imagen.");
+      }
+  
+      const imageBuffer = await imageResponse.arrayBuffer();
+      const base64Image = Buffer.from(imageBuffer).toString("base64");
+  
+      // Enviar la imagen a OpenAI para obtener una descripción.
+      const aiResponse = await openai.chat.completions.create({
+        model: "gpt-4-turbo", // Usa el modelo con visión, si tienes acceso.
+        messages: [
+          {
+            role: "system",
+            content: "Eres un asistente que analiza imágenes de trading y finanzas.",
+          },
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Analiza esta imagen y describe su contenido detalladamente." },
+              { type: "image_url", image_url: { url: `data:image/png;base64,${base64Image}` } },
             ],
-        });
-
-        const description = aiResponse.choices[0]?.message?.content?.trim();
-        if (!description) throw new Error("No se obtuvo una descripción válida de la imagen.");
-        return description;
+          },
+        ],
+      });
+  
+      const description = aiResponse.choices[0]?.message?.content?.trim();
+      if (!description) throw new Error("No se obtuvo una descripción válida de la imagen.");
+      return description;
     } catch (error) {
-        console.error("Error al describir la imagen:", error);
-        throw new Error("No se pudo obtener la descripción de la imagen. Inténtalo más tarde.");
+      console.error("Error al describir la imagen:", error);
+      throw new Error("No se pudo obtener la descripción de la imagen. Inténtalo más tarde.");
     }
-}
+  }
+  
 
 /**
- * Maneja la conversación del chatbot
+ * Maneja la conversación del chatbot y guarda los mensajes en la base de datos.
  */
 const messageQueue = {}; // Cola para acumular mensajes por número de teléfono
 
 const chatHandler = async (req, res, next) => {
-    try {
-        const userMessage = req.body.Body;
-        const userPhoneNumber = req.body.From;
+  try {
+    const userMessage = req.body.Body || "";
+    const userPhoneNumber = req.body.From;
+    const numMedia = parseInt(req.body.NumMedia || "0", 10);
 
-        if (!userMessage || !userPhoneNumber) {
-            res.status(400).json({ error: "Faltan datos en la solicitud." });
-            return;
-        }
-
-        console.log(`Mensaje recibido de ${userPhoneNumber}: ${userMessage}`);
-
-        let finalMessage = userMessage.trim();
-
-        // Detectar si el mensaje es una URL de imagen
-        const imageUrlRegex = /(https?:\/\/.*\.(?:png|jpg|jpeg|gif))/i;
-        const imageUrlMatch = finalMessage.match(imageUrlRegex);
-
-        if (imageUrlMatch) {
-            const imageUrl = imageUrlMatch[0];
-            console.log(`Se detectó una URL de imagen: ${imageUrl}`);
-
-            // Obtener la descripción de la imagen
-            const imageDescription = await describeImage(imageUrl);
-            console.log(`Descripción obtenida: ${imageDescription}`);
-
-            // Usar la descripción como el mensaje final
-            finalMessage = `Imagen detectada. Descripción: ${imageDescription}`;
-        }
-
-        // Agregar el mensaje (o descripción) a la cola
-        if (!messageQueue[userPhoneNumber]) {
-            messageQueue[userPhoneNumber] = {
-                timer: null,
-                messages: [],
-            };
-        }
-
-        messageQueue[userPhoneNumber].messages.push(finalMessage);
-
-        // Reiniciar el temporizador
-        if (messageQueue[userPhoneNumber].timer) {
-            clearTimeout(messageQueue[userPhoneNumber].timer);
-        }
-
-        messageQueue[userPhoneNumber].timer = setTimeout(async () => {
-            // Concatenar mensajes
-            const concatenatedMessage = messageQueue[userPhoneNumber].messages.join(' ');
-            console.log(`Mensajes concatenados de ${userPhoneNumber}: ${concatenatedMessage}`);
-
-            // Limpieza de la cola
-            messageQueue[userPhoneNumber].messages = [];
-            delete messageQueue[userPhoneNumber].timer;
-
-            // Continuar con el flujo original
-            const threadId = await getOrCreateThreadId(userPhoneNumber);
-
-            const message = await openai.beta.threads.messages.create(threadId, {
-                role: "user",
-                content: concatenatedMessage,
-            });
-
-            let run = await openai.beta.threads.runs.create(threadId, {
-                assistant_id: "asst_UFGyAkWkTwdknKwF7PEsZOod",
-            });
-
-            run = await handleRun(threadId, run.id);
-
-            if (run.status === "completed") {
-                const threadMessages = await openai.beta.threads.messages.list(threadId);
-                const aiMessage = extractAssistantMessage(threadMessages);
-
-                // Enviar respuesta a WhatsApp
-                await twilioClient.messages.create({
-                    body: aiMessage,
-                    from: "whatsapp:+18178131389",
-                    to: userPhoneNumber,
-                });
-
-                console.log(`Respuesta enviada a ${userPhoneNumber}: ${aiMessage}`);
-            } else {
-                console.error(`El run no se completó para ${userPhoneNumber}`);
-            }
-        }, 10000); // Espera de 10 segundos
-
-        res.status(200).send("Mensaje recibido y en espera para procesar.");
-    } catch (error) {
-        console.error("Error en el chatHandler:", error);
-        next(error);
+    // Validar que venga al menos texto o media
+    if (!userMessage && numMedia === 0) {
+      return res.status(400).json({ error: "Faltan datos en la solicitud." });
     }
+
+    console.log(`Mensaje recibido de ${userPhoneNumber}: ${userMessage}`);
+
+    // Mensajes para OpenAI y BD
+    let finalMessageForAI = userMessage.trim();
+    let finalMessageForDB = userMessage.trim();
+    let mediaUrlForDB = null;
+
+    // Si hay imagen
+    if (numMedia > 0) {
+      const imageUrl = req.body.MediaUrl0;
+      console.log(`Se detectó imagen en MediaUrl0: ${imageUrl}`);
+
+      const imageDescription = await describeImage(imageUrl);
+      console.log(`Descripción obtenida: ${imageDescription}`);
+
+      // Si hay texto + imagen, concatenar todo en uno
+      if (finalMessageForAI) {
+        finalMessageForAI += `\n[Imagen adjunta] Descripción: ${imageDescription}`;
+        finalMessageForDB += `\nImagen recibida: ${imageUrl}`;
+      } else {
+        finalMessageForAI = `[Imagen adjunta] Descripción: ${imageDescription}`;
+        finalMessageForDB = `Imagen recibida: ${imageUrl}`;
+      }
+
+      mediaUrlForDB = imageUrl;
+    } else {
+      // Si no hay media, pero el texto contiene una URL de imagen
+      const imageUrlRegex = /(https?:\/\/.*\.(?:png|jpg|jpeg|gif))/i;
+      const imageUrlMatch = finalMessageForAI.match(imageUrlRegex);
+
+      if (imageUrlMatch) {
+        const imageUrl = imageUrlMatch[0];
+        console.log(`Se detectó una URL de imagen: ${imageUrl}`);
+
+        const imageDescription = await describeImage(imageUrl);
+        console.log(`Descripción obtenida: ${imageDescription}`);
+
+        finalMessageForAI = `${finalMessageForAI}\n[Imagen adjunta] Descripción: ${imageDescription}`;
+        finalMessageForDB = `${finalMessageForDB}\nImagen recibida: ${imageUrl}`;
+        mediaUrlForDB = imageUrl;
+      }
+    }
+
+    // Crear la cola si no existe
+    if (!messageQueue[userPhoneNumber]) {
+      messageQueue[userPhoneNumber] = {
+        timer: null,
+        messages: [],
+      };
+    }
+
+    // Si ya hay mensajes en la cola, concatenar al último (mismo hilo)
+    const userQueue = messageQueue[userPhoneNumber];
+    if (userQueue.messages.length > 0) {
+      // Tomar el último mensaje acumulado y concatenar
+      const lastMessage = userQueue.messages.pop();
+      lastMessage.forAI += `\n${finalMessageForAI}`;
+      lastMessage.forDB += `\n${finalMessageForDB}`;
+
+      // Si llega otra imagen, puedes decidir si guardar varias URLs o solo la primera
+      if (mediaUrlForDB) {
+        lastMessage.mediaUrl = mediaUrlForDB;
+      }
+
+      // Volver a meter el mensaje concatenado
+      userQueue.messages.push(lastMessage);
+    } else {
+      // Si es el primer mensaje en la cola
+      userQueue.messages.push({
+        forAI: finalMessageForAI,
+        forDB: finalMessageForDB,
+        mediaUrl: mediaUrlForDB,
+      });
+    }
+
+    // Reiniciar el temporizador (se procesa todo tras 10s de inactividad)
+    if (userQueue.timer) {
+      clearTimeout(userQueue.timer);
+    }
+
+    userQueue.timer = setTimeout(async () => {
+      const concatenatedMessageForAI = userQueue.messages
+        .map(msg => msg.forAI)
+        .join('\n');
+
+      const concatenatedMessageForDB = userQueue.messages
+        .map(msg => msg.forDB)
+        .join('\n');
+
+      const mediaUrlsForDB = userQueue.messages
+        .map(msg => msg.mediaUrl)
+        .filter(url => !!url);
+
+      console.log(`Mensajes concatenados de ${userPhoneNumber}: ${concatenatedMessageForAI}`);
+
+      // Vaciar la cola
+      userQueue.messages = [];
+      delete userQueue.timer;
+
+      // Obtener o crear la conversación
+      const conversation = await getOrCreateConversation(userPhoneNumber);
+
+      // Guardar el mensaje en la BD
+      await prisma.userMessage.create({
+        data: {
+          conversationId: conversation.id,
+          role: "user",
+          content: concatenatedMessageForDB,
+          mediaUrl: mediaUrlsForDB.length > 0 ? mediaUrlsForDB[0] : null, // solo 1, si quieres
+        },
+      });
+
+      // Enviar el mensaje a OpenAI
+      await openai.beta.threads.messages.create(conversation.threadId, {
+        role: "user",
+        content: concatenatedMessageForAI,
+      });
+
+      let run = await openai.beta.threads.runs.create(conversation.threadId, {
+        assistant_id: "asst_UFGyAkWkTwdknKwF7PEsZOod",
+      });
+
+      run = await handleRun(conversation.threadId, run.id);
+
+      if (run.status === "completed") {
+        const threadMessages = await openai.beta.threads.messages.list(conversation.threadId);
+        const aiMessage = extractAssistantMessage(threadMessages);
+
+        // Guardar la respuesta del asistente en la BD
+        await prisma.userMessage.create({
+          data: {
+            conversationId: conversation.id,
+            role: "assistant",
+            content: aiMessage,
+            mediaUrl: null,
+          },
+        });
+
+        // Enviar respuesta a WhatsApp
+        await twilioClient.messages.create({
+          body: aiMessage,
+          from: "whatsapp:+18178131389",
+          to: userPhoneNumber,
+        });
+
+        console.log(`Respuesta enviada a ${userPhoneNumber}: ${aiMessage}`);
+      } else {
+        console.error(`El run no se completó para ${userPhoneNumber}`);
+      }
+    }, 10000); // 10 segundos de inactividad
+
+    res.status(200).send("Mensaje recibido y en espera para procesar.");
+  } catch (error) {
+    console.error("Error en el chatHandler:", error);
+    next(error);
+  }
 };
 
+  
 function extractAssistantMessage(threadMessages) {
-    const messages = threadMessages.data.filter((msg) => msg.role === 'assistant');
-    return messages.length > 0
-        ? messages[0].content[0]?.text?.value || 'No hay respuesta del asistente'
-        : 'No se encontró respuesta del asistente';
+  const messages = threadMessages.data.filter((msg) => msg.role === 'assistant');
+  return messages.length > 0
+    ? messages[0].content[0]?.text?.value || 'No hay respuesta del asistente'
+    : 'No se encontró respuesta del asistente';
 }
 
 /**
  * Manejar el estado del run (threads, herramientas, etc.)
  */
 async function handleRun(threadId, runId, timeout = 30000, interval = 1000) {
-    const startTime = Date.now();
+  const startTime = Date.now();
 
-    while (Date.now() - startTime < timeout) {
-        const runStatus = await openai.beta.threads.runs.retrieve(threadId, runId);
+  while (Date.now() - startTime < timeout) {
+    const runStatus = await openai.beta.threads.runs.retrieve(threadId, runId);
 
-        if (runStatus.status === 'completed') {
-            return runStatus;
-        } else if (runStatus.status === 'requires_action') {
-            const requiredAction = runStatus.required_action;
-            if (requiredAction.type === 'submit_tool_outputs') {
-                await handleSubmitToolOutputs(threadId, runId, requiredAction);
-            } else {
-                throw new Error(`Tipo de acción requerida no manejada: ${requiredAction.type}`);
-            }
-        } else if (runStatus.status === 'failed') {
-            throw new Error('El run falló');
-        }
-
-        await new Promise((resolve) => setTimeout(resolve, interval));
+    if (runStatus.status === 'completed') {
+      return runStatus;
+    } else if (runStatus.status === 'requires_action') {
+      const requiredAction = runStatus.required_action;
+      if (requiredAction.type === 'submit_tool_outputs') {
+        await handleSubmitToolOutputs(threadId, runId, requiredAction);
+      } else {
+        throw new Error(`Tipo de acción requerida no manejada: ${requiredAction.type}`);
+      }
+    } else if (runStatus.status === 'failed') {
+      throw new Error('El run falló');
     }
 
-    throw new Error('El run excedió el tiempo de espera');
+    await new Promise((resolve) => setTimeout(resolve, interval));
+  }
+
+  throw new Error('El run excedió el tiempo de espera');
 }
 
 /**
  * Manejar herramientas requeridas (e.g., tools)
  */
 async function handleSubmitToolOutputs(threadId, runId, requiredAction) {
-    const submitToolOutputs = requiredAction.submit_tool_outputs;
-    const toolOutputs = [];
+  const submitToolOutputs = requiredAction.submit_tool_outputs;
+  const toolOutputs = [];
 
-    for (const toolCall of submitToolOutputs.tool_calls) {
-        const functionName = toolCall.function.name;
-        const functionArguments = toolCall.function.arguments;
+  for (const toolCall of submitToolOutputs.tool_calls) {
+    const functionName = toolCall.function.name;
+    const functionArguments = toolCall.function.arguments;
 
-        let toolOutputMessage;
+    let toolOutputMessage;
 
-        switch (functionName) {
-            // Puedes agregar lógica adicional aquí para herramientas específicas
-            default:
-                toolOutputMessage = 'Tool not recognized';
-        }
-
-        toolOutputs.push({
-            tool_call_id: toolCall.id,
-            output: toolOutputMessage,
-        });
+    switch (functionName) {
+      default:
+        toolOutputMessage = 'Tool not recognized';
     }
 
-    await openai.beta.threads.runs.submitToolOutputs(threadId, runId, { tool_outputs: toolOutputs });
+    toolOutputs.push({
+      tool_call_id: toolCall.id,
+      output: toolOutputMessage,
+    });
+  }
+
+  await openai.beta.threads.runs.submitToolOutputs(threadId, runId, { tool_outputs: toolOutputs });
 }
 
+/**
+ * Analiza las conversaciones almacenadas y las etiqueta.
+ * Se actualiza para usar las tablas UserConversation y UserMessage.
+ */
 async function analyzeAndTagClients() {
-    console.log("Iniciando análisis de threads...");
+  console.log("Iniciando análisis de conversaciones...");
 
-    const MAX_TOKENS = 4000; // Máximo seguro para gpt-3.5-turbo
-    const threads = await prisma.thread.findMany();
-    console.log(`Threads encontrados: ${threads.length}`);
+  const MAX_TOKENS = 4000;
+  const conversations = await prisma.userConversation.findMany();
+  console.log(`Conversaciones encontradas: ${conversations.length}`);
 
-    for (const thread of threads) {
-        console.log(`Analizando thread con phoneNumber: ${thread.phoneNumber}`);
+  for (const conversation of conversations) {
+    console.log(`Analizando conversación con phoneNumber: ${conversation.phoneNumber}`);
 
-        try {
-            const tags = [];
-            const messages = await openai.beta.threads.messages.list(thread.threadId);
+    try {
+      const tags = [];
+      const messagesRecords = await prisma.userMessage.findMany({
+        where: { conversationId: conversation.id },
+      });
 
-            // Obtener mensajes válidos
-            const userMessages = messages.data
-                .filter((msg) => typeof msg.content === "string")
-                .map((msg) => msg.content.trim());
+      const userMessages = messagesRecords
+        .filter((msg) => typeof msg.content === "string")
+        .map((msg) => msg.content.trim());
 
-            console.log(`Mensajes totales encontrados: ${userMessages.length}`);
+      console.log(`Mensajes totales encontrados: ${userMessages.length}`);
 
-            // Eliminar duplicados
-            const uniqueMessages = [...new Set(userMessages)];
-            console.log(`Mensajes únicos: ${uniqueMessages.length}`);
+      const uniqueMessages = [...new Set(userMessages)];
+      console.log(`Mensajes únicos: ${uniqueMessages.length}`);
 
-            // Si no hay mensajes válidos, marcar como interesado y continuar
-            if (uniqueMessages.length === 0) {
-                console.log("No hay mensajes únicos válidos para procesar. Clasificando como 'interesado'.");
-                tags.push("interesado");
-                await prisma.thread.update({
-                    where: { id: thread.id },
-                    data: { tags, lastProcessedAt: new Date() },
-                });
-                console.log(`Thread actualizado con tags: ${tags}`);
-                continue;
-            }
+      if (uniqueMessages.length === 0) {
+        console.log("No hay mensajes únicos válidos para procesar. Clasificando como 'interesado'.");
+        tags.push("interesado");
+        await prisma.userConversation.update({
+          where: { id: conversation.id },
+          data: { tags, updatedAt: new Date() },
+        });
+        console.log(`Conversación actualizada con tags: ${tags}`);
+        continue;
+      }
 
-            // Combinar mensajes en un solo string
-            const allUserMessages = uniqueMessages.join(" ");
-            const limitedContent = truncateToMaxTokens(allUserMessages, MAX_TOKENS);
+      const allUserMessages = uniqueMessages.join(" ");
+      const limitedContent = truncateToMaxTokens(allUserMessages, MAX_TOKENS);
 
-            console.log(`Contenido final para el modelo: ${limitedContent.length} caracteres.`);
+      console.log(`Contenido final para el modelo: ${limitedContent.length} caracteres.`);
 
-            if (!limitedContent.trim()) {
-                console.log("El contenido final está vacío. Clasificando como 'interesado'.");
-                tags.push("interesado");
-                await prisma.thread.update({
-                    where: { id: thread.id },
-                    data: { tags, lastProcessedAt: new Date() },
-                });
-                console.log(`Thread actualizado con tags: ${tags}`);
-                continue;
-            }
+      if (!limitedContent.trim()) {
+        console.log("El contenido final está vacío. Clasificando como 'interesado'.");
+        tags.push("interesado");
+        await prisma.userConversation.update({
+          where: { id: conversation.id },
+          data: { tags, updatedAt: new Date() },
+        });
+        console.log(`Conversación actualizada con tags: ${tags}`);
+        continue;
+      }
 
-            // Crear prompt para clasificación
-            const prompt = `
+      const prompt = `
 Eres un asistente que clasifica conversaciones. Clasifica al cliente como:
 - "comprador": si muestra intención de comprar.
 - "interesado": si muestra interés pero no confirma la compra.
@@ -298,60 +408,59 @@ ${limitedContent}
 
 Responde con "comprador", "interesado" o "indeterminado".`;
 
-            const response = await openai.chat.completions.create({
-                model: "gpt-3.5-turbo",
-                messages: [
-                    { role: "system", content: "Eres un asistente que clasifica conversaciones." },
-                    { role: "user", content: prompt },
-                ],
-                max_tokens: 10,
-            });
+      const response = await openai.chat.completions.create({
+        model: "gpt-3.5-turbo",
+        messages: [
+          { role: "system", content: "Eres un asistente que clasifica conversaciones." },
+          { role: "user", content: prompt },
+        ],
+        max_tokens: 10,
+      });
 
-            const classification = response.choices[0]?.message?.content?.trim().toLowerCase();
+      const classification = response.choices[0]?.message?.content?.trim().toLowerCase();
 
-            console.log(`Clasificación recibida: ${classification}`);
+      console.log(`Clasificación recibida: ${classification}`);
 
-            if (classification === "comprador" || classification === "interesado") {
-                tags.push(classification);
-            } else {
-                console.warn(`Clasificación no válida: ${classification}`);
-            }
+      if (classification === "comprador" || classification === "interesado") {
+        tags.push(classification);
+      } else {
+        console.warn(`Clasificación no válida: ${classification}`);
+      }
 
-            // Actualizar los tags en la base de datos si hay alguno válido
-            if (tags.length > 0) {
-                await prisma.thread.update({
-                    where: { id: thread.id },
-                    data: { tags, lastProcessedAt: new Date() },
-                });
-                console.log(`Thread actualizado con tags: ${tags}`);
-            } else {
-                console.log("No se encontraron tags válidos para actualizar.");
-            }
-        } catch (error) {
-            console.error(`Error procesando el thread ${thread.id}:`, error);
-        }
+      if (tags.length > 0) {
+        await prisma.userConversation.update({
+          where: { id: conversation.id },
+          data: { tags, updatedAt: new Date() },
+        });
+        console.log(`Conversación actualizada con tags: ${tags}`);
+      } else {
+        console.log("No se encontraron tags válidos para actualizar.");
+      }
+    } catch (error) {
+      console.error(`Error procesando la conversación ${conversation.id}:`, error);
     }
+  }
 
-    console.log("Análisis y etiquetado completados.");
+  console.log("Análisis y etiquetado completados.");
 }
 
 /**
  * Trunca el texto para que no exceda el límite de tokens.
  */
 function truncateToMaxTokens(content, maxTokens) {
-    const tokens = content.split(" "); // Aproximación simple para dividir en tokens
-    return tokens.length > maxTokens ? tokens.slice(-maxTokens).join(" ") : content;
+  const tokens = content.split(" ");
+  return tokens.length > maxTokens ? tokens.slice(-maxTokens).join(" ") : content;
 }
 
 // Rutas principales
 chatbotRoutes.get('/test', async (req, res) => {
-    res.json({ message: "¡Hola, mundo!" });
+  res.json({ message: "¡Hola, mundo!" });
 });
 
 chatbotRoutes.post('/chat', chatHandler);
 
 module.exports = {
-    chatbotRoutes,
-    analyzeAndTagClients, // Asegúrate de que analyzeAndTagClients esté aquí.
-    sendPromotionalMessage,
+  chatbotRoutes,
+  analyzeAndTagClients,
+  sendPromotionalMessage,
 };
