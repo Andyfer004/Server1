@@ -1,4 +1,7 @@
 "use strict";
+const openai = require("./openai"); 
+const { PrismaClient } = require('@prisma/client');
+const prisma = new PrismaClient();
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
@@ -151,9 +154,77 @@ const createCheckout = async (lineItems) => {
         throw new Error('No pudimos crear el checkout, por favor intenta más tarde.');
     }
 };
+
+async function saveOrder(userPhoneNumber, message) {
+    try {
+        console.log("📝 Recibido un mensaje de pedido:", message);
+
+        const aiResponse = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [
+                {
+                    role: "user",
+                    content: `Extrae en formato JSON (sin explicaciones) el siguiente pedido:
+Mensaje: "${message}"
+Debe tener las claves: firstName, lastName, nit (opcional), product y quantity.
+Responde **solo con JSON puro**, sin explicaciones ni texto adicional.`
+                }
+            ]
+        });
+
+        let content = aiResponse.choices[0].message.content;
+        console.log("🔍 Respuesta de OpenAI antes de limpiar:", content);
+
+        // **Limpieza de la respuesta** (elimina los ```json y ``` que están alrededor del JSON)
+        content = content.replace(/```json\n?/, "").replace(/\n?```/, "").trim();
+
+        console.log("✅ Respuesta limpia de OpenAI:", content);
+
+        let orderData;
+        try {
+            orderData = JSON.parse(content);
+        } catch (parseError) {
+            console.error("❌ Error al parsear el JSON extraído:", parseError);
+            return "No pude entender tu pedido. Asegúrate de enviarlo en el formato correcto.";
+        }
+
+        // **Verificar si los datos se extrajeron correctamente**
+        console.log("📦 Datos extraídos del pedido:", orderData);
+
+        if (!orderData.firstName || !orderData.lastName || !orderData.product || !orderData.quantity) {
+            console.error("❌ Faltan datos en el pedido extraído:", orderData);
+            return "No pude entender tu pedido. Asegúrate de enviarlo en el formato correcto.";
+        }
+
+        // **Intentar guardar en la base de datos**
+        console.log("📌 Intentando guardar en la base de datos...");
+
+        await prisma.order.create({
+            data: {
+                phoneNumber: userPhoneNumber,
+                name: orderData.firstName,
+                lastName: orderData.lastName,
+                nit: orderData.nit || null,
+                product: orderData.product,
+                quantity: parseInt(orderData.quantity, 10)
+            },
+        });
+
+        console.log("✅ Pedido guardado exitosamente en la base de datos.");
+
+        return `✅ Pedido registrado:\n👤 Cliente: ${orderData.firstName} ${orderData.lastName}\n📌 Producto: ${orderData.product}\n🔢 Cantidad: ${orderData.quantity}`;
+    } catch (error) {
+        console.error("🚨 Error al guardar pedido:", error);
+        return "Hubo un error al procesar el pedido. Inténtalo nuevamente.";
+    }
+}
+
+
+exports.saveOrder = saveOrder;
 exports.tools = {
     deliveryStatus: exports.deliveryStatus,
     catalogProducts: exports.catalogProducts,
     similarProducts: exports.similarProducts,
+    saveOrder,
     createCheckout
 };

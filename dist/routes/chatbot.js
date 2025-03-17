@@ -1,27 +1,206 @@
 const express = require('express');
 const openai = require('./openai'); // API de OpenAI
+const ExcelJS = require("exceljs");
+const fs = require("fs");
+const path = require("path");
+const { parse } = require("json2csv");
 const { PrismaClient } = require('@prisma/client');
-const twilio = require('twilio');
+const axios = require('axios');
+const { saveOrder } = require("./tools");
 
 const chatbotRoutes = express.Router();
 const prisma = new PrismaClient();
 
-const twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+// Se eliminó la dependencia de Twilio
+phoneNumber = "whatsapp:+50259120285";
+
+chatbotRoutes.get("/orders/today", async (req, res) => {
+  try {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const orders = await prisma.order.findMany({
+      where: { createdAt: { gte: today } },
+      orderBy: { createdAt: "desc" },
+    });
+
+    res.json({ orders });
+  } catch (error) {
+    console.error("Error al obtener pedidos del día:", error);
+    res.status(500).json({ error: "Error al obtener pedidos del día." });
+  }
+});
+
+// 📌 Obtener pedidos en un rango de fechas
+chatbotRoutes.get("/orders/by-date", async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    if (!startDate || !endDate) {
+      return res.status(400).json({ error: "Debes proporcionar startDate y endDate en formato YYYY-MM-DD." });
+    }
+
+    const start = new Date(startDate);
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(endDate);
+    end.setHours(23, 59, 59, 999);
+
+    const orders = await prisma.order.findMany({
+      where: { createdAt: { gte: start, lte: end } },
+      orderBy: { createdAt: "desc" },
+    });
+
+    res.json({ orders });
+  } catch (error) {
+    console.error("Error al obtener pedidos por fecha:", error);
+    res.status(500).json({ error: "Error al obtener pedidos por fecha." });
+  }
+});
+
+// 📌 Exportar pedidos a Excel o CSV
+chatbotRoutes.get("/orders/export", async (req, res) => {
+  try {
+    const { startDate, endDate, format } = req.query;
+    if (!startDate || !endDate || !format) {
+      return res.status(400).json({ error: "Debes proporcionar startDate, endDate y el formato (excel o csv)." });
+    }
+
+    const start = new Date(startDate);
+    start.setHours(0, 0, 0, 0);
+    const end = new Date(endDate);
+    end.setHours(23, 59, 59, 999);
+
+    const orders = await prisma.order.findMany({
+      where: { createdAt: { gte: start, lte: end } },
+      orderBy: { createdAt: "desc" },
+    });
+
+    if (format === "excel") {
+      const filePath = await exportOrdersToExcel(orders);
+      return res.download(filePath, "Pedidos.xlsx");
+    } else if (format === "csv") {
+      const filePath = await exportOrdersToCSV(orders);
+      return res.download(filePath, "Pedidos.csv");
+    } else {
+      return res.status(400).json({ error: "Formato inválido, usa 'excel' o 'csv'." });
+    }
+  } catch (error) {
+    console.error("Error al exportar pedidos:", error);
+    res.status(500).json({ error: "Error al exportar pedidos." });
+  }
+});
+
+
+chatbotRoutes.post('/broadcast', async (req, res, next) => {
+  try {
+    const { message, label } = req.body;
+
+    if (!message) {
+      return res.status(400).json({ error: "El mensaje es obligatorio." });
+    }
+
+    let users;
+    if (label) {
+      // Filtrar solo los usuarios con la etiqueta específica
+      users = await prisma.userConversation.findMany({
+        where: { label: label },
+        select: { phoneNumber: true },
+      });
+    } else {
+      // Si no se especifica una etiqueta, enviar a todos
+      users = await prisma.userConversation.findMany({
+        select: { phoneNumber: true },
+      });
+    }
+
+    if (users.length === 0) {
+      return res.status(404).json({ message: "No hay usuarios con esta etiqueta." });
+    }
+
+    console.log(`📢 Enviando mensaje a ${users.length} usuarios`);
+
+    // Enviar el mensaje a cada usuario
+    for (const user of users) {
+      await sendWAHAMessage(user.phoneNumber, message);
+    }
+
+    return res.json({ message: `Mensaje enviado a ${users.length} usuarios.` });
+  } catch (error) {
+    console.error("Error en broadcast:", error);
+    next(error);
+  }
+});
+
+
+async function exportOrdersToExcel(orders) {
+  const workbook = new ExcelJS.Workbook();
+  const sheet = workbook.addWorksheet("Pedidos");
+
+  sheet.columns = [
+    { header: "Nombre", key: "name", width: 20 },
+    { header: "Apellido", key: "lastName", width: 20 },
+    { header: "NIT", key: "nit", width: 15 },
+    { header: "Producto", key: "product", width: 30 },
+    { header: "Cantidad", key: "quantity", width: 10 },
+    { header: "Fecha", key: "createdAt", width: 20 },
+  ];
+
+  orders.forEach((order) => {
+    sheet.addRow({
+      name: order.name,
+      lastName: order.lastName,
+      nit: order.nit || "N/A",
+      product: order.product,
+      quantity: order.quantity,
+      createdAt: order.createdAt.toISOString(),
+    });
+  });
+
+  const filePath = path.join(__dirname, "Pedidos.xlsx");
+  await workbook.xlsx.writeFile(filePath);
+  return filePath;
+}
+
+async function exportOrdersToCSV(orders) {
+  const fields = ["name", "lastName", "nit", "product", "quantity", "createdAt"];
+  const opts = { fields };
+  const csv = parse(orders, opts);
+
+  const filePath = path.join(__dirname, "Pedidos.csv");
+  fs.writeFileSync(filePath, csv);
+  return filePath;
+}
+
 
 function formatPhoneNumberForWhatsApp(phoneNumber) {
   const sanitizedNumber = phoneNumber.replace(/[^\d]/g, ""); // Elimina caracteres no numéricos
-  return `whatsapp:+${sanitizedNumber}`;
+  // WAHA requiere el formato: número@c.us
+  return `${sanitizedNumber}@c.us`;
+}
+
+// Función para enviar mensajes vía WAHA usando Axios
+async function sendWAHAMessage(phoneNumber, message) {
+  try {
+    const chatId = formatPhoneNumberForWhatsApp(phoneNumber);
+    await axios.post('http://localhost:5001/api/sendText', {
+      chatId: chatId,
+      text: message,
+      session: "default" // Nombre de la sesión configurada en WAHA
+    }, {
+      headers: {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json'
+      }
+    });
+    console.log(`Mensaje enviado a ${chatId} vía WAHA`);
+  } catch (error) {
+    console.error(`Error al enviar mensaje a ${phoneNumber} con WAHA:`, error);
+  }
 }
 
 async function sendPromotionalMessage(phoneNumber, message) {
   try {
-    const formattedNumber = formatPhoneNumberForWhatsApp(phoneNumber);
-    await twilioClient.messages.create({
-      body: message,
-      from: "whatsapp:+18178131389",
-      to: formattedNumber,
-    });
-    console.log(`Mensaje promocional enviado a ${formattedNumber}`);
+    await sendWAHAMessage(phoneNumber, message);
+    console.log(`Mensaje promocional enviado a ${phoneNumber} vía WAHA`);
   } catch (error) {
     console.error(`Error al enviar mensaje a ${phoneNumber}:`, error);
   }
@@ -52,58 +231,55 @@ async function getOrCreateConversation(phoneNumber) {
  * Función para obtener la descripción de una imagen mediante OpenAI.
  */
 async function describeImage(imageUrl) {
-    try {
-      console.log("📥 Descargando imagen desde:", imageUrl);
-      
-      // Crear el string de autenticación y codificarlo en base64.
-      const authString = `${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`;
-      const base64Auth = Buffer.from(authString).toString("base64");
-      
-      // Descargar la imagen usando las credenciales de Twilio.
-      const imageResponse = await fetch(imageUrl, {
-        method: "GET",
-        headers: {
-          "User-Agent": "Mozilla/5.0",
-          "Accept": "image/*",
-          "Authorization": `Basic ${base64Auth}`
-        },
-      });
-  
-      if (!imageResponse.ok) {
-        console.error("❌ No se pudo descargar la imagen:", imageResponse.status, imageResponse.statusText);
-        throw new Error("No se pudo descargar la imagen.");
-      }
-  
-      const imageBuffer = await imageResponse.arrayBuffer();
-      const base64Image = Buffer.from(imageBuffer).toString("base64");
-  
-      // Enviar la imagen a OpenAI para obtener una descripción.
-      const aiResponse = await openai.chat.completions.create({
-        model: "gpt-4-turbo", // Usa el modelo con visión, si tienes acceso.
-        messages: [
-          {
-            role: "system",
-            content: "Eres un asistente que analiza imágenes de trading y finanzas.",
-          },
-          {
-            role: "user",
-            content: [
-              { type: "text", text: "Analiza esta imagen y describe su contenido detalladamente." },
-              { type: "image_url", image_url: { url: `data:image/png;base64,${base64Image}` } },
-            ],
-          },
-        ],
-      });
-  
-      const description = aiResponse.choices[0]?.message?.content?.trim();
-      if (!description) throw new Error("No se obtuvo una descripción válida de la imagen.");
-      return description;
-    } catch (error) {
-      console.error("Error al describir la imagen:", error);
-      throw new Error("No se pudo obtener la descripción de la imagen. Inténtalo más tarde.");
+  try {
+    console.log("📥 Descargando imagen desde:", imageUrl);
+
+    // Configurar headers básicos para descargar la imagen (sin autorización)
+    const headers = {
+      "User-Agent": "Mozilla/5.0",
+      "Accept": "image/*"
+    };
+
+    const imageResponse = await fetch(imageUrl, {
+      method: "GET",
+      headers
+    });
+
+    if (!imageResponse.ok) {
+      console.error("❌ No se pudo descargar la imagen:", imageResponse.status, imageResponse.statusText);
+      throw new Error("No se pudo descargar la imagen.");
     }
+
+    const imageBuffer = await imageResponse.arrayBuffer();
+    const base64Image = Buffer.from(imageBuffer).toString("base64");
+
+    // Enviar la imagen a OpenAI para obtener una descripción.
+    const aiResponse = await openai.chat.completions.create({
+      model: "gpt-4-turbo", // Usa el modelo con visión, si tienes acceso.
+      messages: [
+        {
+          role: "system",
+          content: "Eres un asistente que analiza imágenes de trading y finanzas.",
+        },
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "Analiza esta imagen y describe su contenido detalladamente." },
+            { type: "image_url", image_url: { url: `data:image/png;base64,${base64Image}` } },
+          ],
+        },
+      ],
+    });
+
+    const description = aiResponse.choices[0]?.message?.content?.trim();
+    if (!description) throw new Error("No se obtuvo una descripción válida de la imagen.");
+    return description;
+  } catch (error) {
+    console.error("Error al describir la imagen:", error);
+    throw new Error("No se pudo obtener la descripción de la imagen. Inténtalo más tarde.");
   }
-  
+}
+
 
 /**
  * Maneja la conversación del chatbot y guarda los mensajes en la base de datos.
@@ -112,165 +288,105 @@ const messageQueue = {}; // Cola para acumular mensajes por número de teléfono
 
 const chatHandler = async (req, res, next) => {
   try {
-    const userMessage = req.body.Body || "";
-    const userPhoneNumber = req.body.From;
-    const numMedia = parseInt(req.body.NumMedia || "0", 10);
+    console.log("DEBUG: req.body =", req.body);
 
-    // Validar que venga al menos texto o media
+    let data = req.body;
+    if (data.payload) {
+      data = data.payload;
+    }
+
+    const userMessage = data.Body || data.body || "";
+    const userPhoneNumber = data.From || data.from || "";
+    const numMedia = data.hasMedia ? 1 : 0;
+
     if (!userMessage && numMedia === 0) {
       return res.status(400).json({ error: "Faltan datos en la solicitud." });
     }
 
     console.log(`Mensaje recibido de ${userPhoneNumber}: ${userMessage}`);
 
-    // Mensajes para OpenAI y BD
+    // **📌 1. Si el mensaje es una intención de compra pero no tiene datos, pedirlos**
+    const lowerMsg = userMessage.toLowerCase();
+    if (lowerMsg.includes("pedido") || lowerMsg.includes("comprar")) {
+      await sendWAHAMessage(
+        userPhoneNumber,
+        "¡Entendido! Para procesar tu pedido, necesito los siguientes datos:\n📌 *Nombre y Apellido*\n📌 *NIT* (Opcional)\n📌 *Producto*\n📌 *Cantidad*\n\nPor favor, envíalos en un solo mensaje. Ejemplo:\n_Juan Pérez, NIT 12345678, Zapatos Nike, 2 unidades_."
+      );
+      return res.status(200).json({
+        message:
+          "¡Entendido! Para procesar tu pedido, necesito los siguientes datos: Nombre y Apellido, NIT (Opcional), Producto y Cantidad.",
+      });
+    }
+
+    // **📌 2. Si el mensaje ya contiene los datos del pedido, intentar guardarlo**
+    if (
+      userMessage.includes(",") &&
+      (userMessage.toLowerCase().includes("nit") || userMessage.match(/\d+/))
+    ) {
+      const orderResponse = await saveOrder(userPhoneNumber, userMessage);
+      await sendWAHAMessage(userPhoneNumber, orderResponse);
+      return res.status(200).json({ message: orderResponse });
+    }
+
+    // **📌 3. Flujo normal del chatbot si NO es un pedido**
     let finalMessageForAI = userMessage.trim();
     let finalMessageForDB = userMessage.trim();
     let mediaUrlForDB = null;
 
-    // Si hay imagen
     if (numMedia > 0) {
-      const imageUrl = req.body.MediaUrl0;
-      console.log(`Se detectó imagen en MediaUrl0: ${imageUrl}`);
-
-      const imageDescription = await describeImage(imageUrl);
-      console.log(`Descripción obtenida: ${imageDescription}`);
-
-      // Si hay texto + imagen, concatenar todo en uno
-      if (finalMessageForAI) {
-        finalMessageForAI += `\n[Imagen adjunta] Descripción: ${imageDescription}`;
-        finalMessageForDB += `\nImagen recibida: ${imageUrl}`;
-      } else {
-        finalMessageForAI = `[Imagen adjunta] Descripción: ${imageDescription}`;
-        finalMessageForDB = `Imagen recibida: ${imageUrl}`;
+      let imageUrl = null;
+      if (data.media) {
+        imageUrl = typeof data.media === "object" ? data.media.url : data.media;
+      } else if (data.MediaUrl0) {
+        imageUrl = data.MediaUrl0;
       }
 
-      mediaUrlForDB = imageUrl;
-    } else {
-      // Si no hay media, pero el texto contiene una URL de imagen
-      const imageUrlRegex = /(https?:\/\/.*\.(?:png|jpg|jpeg|gif))/i;
-      const imageUrlMatch = finalMessageForAI.match(imageUrlRegex);
-
-      if (imageUrlMatch) {
-        const imageUrl = imageUrlMatch[0];
-        console.log(`Se detectó una URL de imagen: ${imageUrl}`);
-
+      if (imageUrl) {
+        console.log(`Se detectó imagen: ${imageUrl}`);
         const imageDescription = await describeImage(imageUrl);
         console.log(`Descripción obtenida: ${imageDescription}`);
-
-        finalMessageForAI = `${finalMessageForAI}\n[Imagen adjunta] Descripción: ${imageDescription}`;
-        finalMessageForDB = `${finalMessageForDB}\nImagen recibida: ${imageUrl}`;
+        finalMessageForAI += `\n[Imagen adjunta] Descripción: ${imageDescription}`;
+        finalMessageForDB += `\nImagen recibida: ${imageUrl}`;
         mediaUrlForDB = imageUrl;
       }
     }
 
-    // Crear la cola si no existe
-    if (!messageQueue[userPhoneNumber]) {
-      messageQueue[userPhoneNumber] = {
-        timer: null,
-        messages: [],
-      };
-    }
-
-    // Si ya hay mensajes en la cola, concatenar al último (mismo hilo)
-    const userQueue = messageQueue[userPhoneNumber];
-    if (userQueue.messages.length > 0) {
-      // Tomar el último mensaje acumulado y concatenar
-      const lastMessage = userQueue.messages.pop();
-      lastMessage.forAI += `\n${finalMessageForAI}`;
-      lastMessage.forDB += `\n${finalMessageForDB}`;
-
-      // Si llega otra imagen, puedes decidir si guardar varias URLs o solo la primera
-      if (mediaUrlForDB) {
-        lastMessage.mediaUrl = mediaUrlForDB;
-      }
-
-      // Volver a meter el mensaje concatenado
-      userQueue.messages.push(lastMessage);
-    } else {
-      // Si es el primer mensaje en la cola
-      userQueue.messages.push({
-        forAI: finalMessageForAI,
-        forDB: finalMessageForDB,
+    const conversation = await getOrCreateConversation(userPhoneNumber);
+    await prisma.userMessage.create({
+      data: {
+        conversationId: conversation.id,
+        role: "user",
+        content: finalMessageForDB,
         mediaUrl: mediaUrlForDB,
-      });
-    }
+      },
+    });
 
-    // Reiniciar el temporizador (se procesa todo tras 10s de inactividad)
-    if (userQueue.timer) {
-      clearTimeout(userQueue.timer);
-    }
+    await openai.beta.threads.messages.create(conversation.threadId, {
+      role: "user",
+      content: finalMessageForAI,
+    });
 
-    userQueue.timer = setTimeout(async () => {
-      const concatenatedMessageForAI = userQueue.messages
-        .map(msg => msg.forAI)
-        .join('\n');
+    let run = await openai.beta.threads.runs.create(conversation.threadId, {
+      assistant_id: "asst_UFGyAkWkTwdknKwF7PEsZOod",
+    });
 
-      const concatenatedMessageForDB = userQueue.messages
-        .map(msg => msg.forDB)
-        .join('\n');
+    run = await handleRun(conversation.threadId, run.id);
 
-      const mediaUrlsForDB = userQueue.messages
-        .map(msg => msg.mediaUrl)
-        .filter(url => !!url);
+    if (run.status === "completed") {
+      const threadMessages = await openai.beta.threads.messages.list(conversation.threadId);
+      const aiMessage = extractAssistantMessage(threadMessages);
 
-      console.log(`Mensajes concatenados de ${userPhoneNumber}: ${concatenatedMessageForAI}`);
-
-      // Vaciar la cola
-      userQueue.messages = [];
-      delete userQueue.timer;
-
-      // Obtener o crear la conversación
-      const conversation = await getOrCreateConversation(userPhoneNumber);
-
-      // Guardar el mensaje en la BD
       await prisma.userMessage.create({
         data: {
           conversationId: conversation.id,
-          role: "user",
-          content: concatenatedMessageForDB,
-          mediaUrl: mediaUrlsForDB.length > 0 ? mediaUrlsForDB[0] : null, // solo 1, si quieres
+          role: "assistant",
+          content: aiMessage,
         },
       });
 
-      // Enviar el mensaje a OpenAI
-      await openai.beta.threads.messages.create(conversation.threadId, {
-        role: "user",
-        content: concatenatedMessageForAI,
-      });
-
-      let run = await openai.beta.threads.runs.create(conversation.threadId, {
-        assistant_id: "asst_UFGyAkWkTwdknKwF7PEsZOod",
-      });
-
-      run = await handleRun(conversation.threadId, run.id);
-
-      if (run.status === "completed") {
-        const threadMessages = await openai.beta.threads.messages.list(conversation.threadId);
-        const aiMessage = extractAssistantMessage(threadMessages);
-
-        // Guardar la respuesta del asistente en la BD
-        await prisma.userMessage.create({
-          data: {
-            conversationId: conversation.id,
-            role: "assistant",
-            content: aiMessage,
-            mediaUrl: null,
-          },
-        });
-
-        // Enviar respuesta a WhatsApp
-        await twilioClient.messages.create({
-          body: aiMessage,
-          from: "whatsapp:+18178131389",
-          to: userPhoneNumber,
-        });
-
-        console.log(`Respuesta enviada a ${userPhoneNumber}: ${aiMessage}`);
-      } else {
-        console.error(`El run no se completó para ${userPhoneNumber}`);
-      }
-    }, 10000); // 10 segundos de inactividad
+      await sendWAHAMessage(userPhoneNumber, aiMessage);
+      console.log(`Respuesta enviada a ${userPhoneNumber}: ${aiMessage}`);
+    }
 
     res.status(200).send("Mensaje recibido y en espera para procesar.");
   } catch (error) {
@@ -279,7 +395,14 @@ const chatHandler = async (req, res, next) => {
   }
 };
 
-  
+
+module.exports = {
+  chatHandler,
+  // Otros exports que tengas
+};
+
+
+
 function extractAssistantMessage(threadMessages) {
   const messages = threadMessages.data.filter((msg) => msg.role === 'assistant');
   return messages.length > 0
@@ -458,6 +581,71 @@ chatbotRoutes.get('/test', async (req, res) => {
 });
 
 chatbotRoutes.post('/chat', chatHandler);
+
+// Función para actualizar las etiquetas de todas las conversaciones
+async function updateConversationLabels() {
+  // Recuperar todas las conversaciones
+  const conversations = await prisma.userConversation.findMany();
+  const results = [];
+
+  // Recorrer cada conversación
+  for (const conv of conversations) {
+    // Obtener los mensajes asociados a la conversación
+    const messagesRecords = await prisma.userMessage.findMany({
+      where: { conversationId: conv.id },
+    });
+    // Concatenar el contenido de todos los mensajes
+    const messagesText = messagesRecords.map(m => m.content).join(" ");
+
+    // Construir el prompt para clasificar
+    const prompt = `
+Eres un asistente que clasifica conversaciones.
+Basado en el siguiente historial, clasifica al cliente como:
+- "comprador" si muestra intención de comprar,
+- "interesado" si solo muestra interés,
+- "indeterminado" en otro caso.
+Historial: ${messagesText}
+Responde solo con una de las palabras: comprador, interesado, indeterminado.
+    `;
+
+    // Llamar a OpenAI para obtener la clasificación
+    const response = await openai.chat.completions.create({
+      model: "gpt-3.5-turbo",
+      messages: [
+        { role: "system", content: "Eres un asistente que clasifica conversaciones." },
+        { role: "user", content: prompt }
+      ],
+      max_tokens: 10,
+    });
+    const classification = response.choices[0]?.message?.content?.trim().toLowerCase();
+
+    // Determinar la etiqueta a asignar (si no es "comprador" ni "interesado", se marcará como "indeterminado")
+    let label = "indeterminado";
+    if (classification === "comprador" || classification === "interesado") {
+      label = classification;
+    }
+
+    // Actualizar la conversación en la base de datos con la etiqueta
+    await prisma.userConversation.update({
+      where: { id: conv.id },
+      data: { label: label },
+    });
+
+    results.push({ conversationId: conv.id, label: label });
+  }
+  return results;
+}
+
+// Endpoint en el router del chatbot para actualizar etiquetas
+chatbotRoutes.post('/label', async (req, res, next) => {
+  try {
+    const result = await updateConversationLabels();
+    res.json({ message: "Etiquetas actualizadas", result });
+  } catch (error) {
+    next(error);
+  }
+});
+
 
 module.exports = {
   chatbotRoutes,
