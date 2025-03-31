@@ -8,29 +8,30 @@ datasource db {
 }
 
 model UserConversation {
-  id         String        @id @default(cuid())
-  phoneNumber String       @unique      // Usaremos el número de WhatsApp como identificador
-  label       String?  
-  createdAt  DateTime      @default(now())
-  updatedAt  DateTime      @updatedAt
-  threadId   String?                     // (Opcional) para guardar el threadId de OpenAI si lo necesitas
-  messages   UserMessage[]
+  id          String        @id @default(cuid())
+  phoneNumber String        @unique
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  threadId    String?
+  label       String?
+  isPaused    Boolean       @default(false)
   orders      Order[]
+  messages    UserMessage[]
 }
 
 model UserMessage {
   id             String           @id @default(cuid())
   conversationId String
-  role           String           // "user" o "assistant"
+  role           String
   content        String
-  mediaUrl       String?          // Almacena la URL de la imagen si existe
   createdAt      DateTime         @default(now())
+  mediaUrl       String?
   conversation   UserConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
 }
 
 model Order {
   id           String           @id @default(cuid())
-  phoneNumber  String           // Relación con UserConversation
+  phoneNumber  String
   createdAt    DateTime         @default(now())
   name         String
   lastName     String

@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  waha:
+    image: devlikeapro/waha:arm
+    container_name: waha
+    ports:
+      - "5002:5000"
+      - "3000:3000"
+    environment:
+      BASE_URL: https://pretty-experts-hunt.loca.lt/api/chatbot/chat
+      PUBLIC_URL: https://pretty-experts-hunt.loca.lt
+      PORT: 5000
+      MEDIA_PATH: /app/public/files
+    volumes:
+      - waha-data:/app/data
+      - ./media:/app/public/files
+
+volumes:
+  waha-data:
+
+
+# comandos para levantar
+#docker pull devlikeapro/waha:arm
+#docker tag devlikeapro/waha:arm devlikeapro/waha
+#docker-compose up -d

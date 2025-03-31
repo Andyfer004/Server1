@@ -7,12 +7,23 @@ const { parse } = require("json2csv");
 const { PrismaClient } = require('@prisma/client');
 const axios = require('axios');
 const { saveOrder } = require("./tools");
+const { createClient } = require('@supabase/supabase-js');
+const fetch = require('node-fetch');
 
 const chatbotRoutes = express.Router();
 const prisma = new PrismaClient();
 
 // Se eliminó la dependencia de Twilio
 phoneNumber = "whatsapp:+50259120285";
+const PUBLIC_BASE_URL = "https://pretty-experts-hunt.loca.lt";
+
+// Configuración de Supabase
+const supabase = createClient(
+  'https://YOUR_SUPABASE_URL', // tu URL de Supabase
+  'YOUR_SUPABASE_ANON_KEY'    // tu clave anónima de Supabase
+);
+
+
 
 chatbotRoutes.get("/orders/today", async (req, res) => {
   try {
@@ -178,22 +189,38 @@ function formatPhoneNumberForWhatsApp(phoneNumber) {
 }
 
 // Función para enviar mensajes vía WAHA usando Axios
-async function sendWAHAMessage(phoneNumber, message) {
+async function sendWAHAMessage(phoneNumber, message, mediaUrl = null) {
   try {
     const chatId = formatPhoneNumberForWhatsApp(phoneNumber);
-    await axios.post('http://localhost:5001/api/sendText', {
+
+    // 🔁 Reemplazar localhost en media URL si es necesario
+    if (mediaUrl && mediaUrl.startsWith("http://localhost:3000")) {
+      mediaUrl = mediaUrl.replace("http://localhost:3000", PUBLIC_BASE_URL);
+    }
+
+    const payload = {
       chatId: chatId,
       text: message,
-      session: "default" // Nombre de la sesión configurada en WAHA
-    }, {
+      session: "default",
+    };
+
+    if (mediaUrl) {
+      payload.media = {
+        url: mediaUrl,
+        caption: message,
+      };
+    }
+
+    await axios.post("http://localhost:5002/api/sendText", payload, {
       headers: {
-        'Accept': 'application/json',
-        'Content-Type': 'application/json'
-      }
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+      },
     });
-    console.log(`Mensaje enviado a ${chatId} vía WAHA`);
+
+    console.log(`✅ Mensaje enviado a ${chatId} vía WAHA`);
   } catch (error) {
-    console.error(`Error al enviar mensaje a ${phoneNumber} con WAHA:`, error);
+    console.error(`❌ Error al enviar mensaje a ${phoneNumber} con WAHA:`, error);
   }
 }
 
@@ -212,6 +239,7 @@ async function sendPromotionalMessage(phoneNumber, message) {
 async function getOrCreateConversation(phoneNumber) {
   let conversation = await prisma.userConversation.findUnique({
     where: { phoneNumber },
+    select: { id: true, threadId: true, isPaused: true }, // 🔹 Incluir `isPaused`
   });
 
   if (!conversation) {
@@ -220,12 +248,15 @@ async function getOrCreateConversation(phoneNumber) {
       data: {
         phoneNumber,
         threadId: newThread.id,
+        isPaused: false, // 🔹 Nueva conversación inicia activa
       },
+      select: { id: true, threadId: true, isPaused: true }, // 🔹 Asegurar que obtenemos `isPaused`
     });
   }
 
   return conversation;
 }
+
 
 /**
  * Función para obtener la descripción de una imagen mediante OpenAI.
@@ -303,36 +334,34 @@ const chatHandler = async (req, res, next) => {
       return res.status(400).json({ error: "Faltan datos en la solicitud." });
     }
 
-    console.log(`Mensaje recibido de ${userPhoneNumber}: ${userMessage}`);
+    console.log(`📨 Mensaje recibido de ${userPhoneNumber}: ${userMessage}`);
 
-    // **📌 1. Si el mensaje es una intención de compra pero no tiene datos, pedirlos**
-    const lowerMsg = userMessage.toLowerCase();
-    if (lowerMsg.includes("pedido") || lowerMsg.includes("comprar")) {
-      await sendWAHAMessage(
-        userPhoneNumber,
-        "¡Entendido! Para procesar tu pedido, necesito los siguientes datos:\n📌 *Nombre y Apellido*\n📌 *NIT* (Opcional)\n📌 *Producto*\n📌 *Cantidad*\n\nPor favor, envíalos en un solo mensaje. Ejemplo:\n_Juan Pérez, NIT 12345678, Zapatos Nike, 2 unidades_."
-      );
+    // **📌 Obtener la conversación y verificar si está pausada**
+    const conversation = await getOrCreateConversation(userPhoneNumber);
+
+    if (conversation.isPaused) {
+      console.log(`🚫 Automatización pausada para ${userPhoneNumber}. No se responderá automáticamente.`);
+
+      // Guardar el mensaje en la base de datos sin responder
+      await prisma.userMessage.create({
+        data: {
+          conversationId: conversation.id,
+          role: "user",
+          content: userMessage,
+        },
+      });
+
       return res.status(200).json({
-        message:
-          "¡Entendido! Para procesar tu pedido, necesito los siguientes datos: Nombre y Apellido, NIT (Opcional), Producto y Cantidad.",
+        message: "La automatización está pausada. Mensaje almacenado, pero sin respuesta automática.",
       });
     }
 
-    // **📌 2. Si el mensaje ya contiene los datos del pedido, intentar guardarlo**
-    if (
-      userMessage.includes(",") &&
-      (userMessage.toLowerCase().includes("nit") || userMessage.match(/\d+/))
-    ) {
-      const orderResponse = await saveOrder(userPhoneNumber, userMessage);
-      await sendWAHAMessage(userPhoneNumber, orderResponse);
-      return res.status(200).json({ message: orderResponse });
-    }
-
-    // **📌 3. Flujo normal del chatbot si NO es un pedido**
+    // **📌 Continuar con el procesamiento normal si la automatización NO está pausada**
     let finalMessageForAI = userMessage.trim();
     let finalMessageForDB = userMessage.trim();
     let mediaUrlForDB = null;
 
+    // **📌 Procesar imágenes si existen**
     if (numMedia > 0) {
       let imageUrl = null;
       if (data.media) {
@@ -342,16 +371,16 @@ const chatHandler = async (req, res, next) => {
       }
 
       if (imageUrl) {
-        console.log(`Se detectó imagen: ${imageUrl}`);
+        console.log(`🖼️ Imagen detectada: ${imageUrl}`);
         const imageDescription = await describeImage(imageUrl);
-        console.log(`Descripción obtenida: ${imageDescription}`);
+        console.log(`📄 Descripción obtenida: ${imageDescription}`);
         finalMessageForAI += `\n[Imagen adjunta] Descripción: ${imageDescription}`;
         finalMessageForDB += `\nImagen recibida: ${imageUrl}`;
         mediaUrlForDB = imageUrl;
       }
     }
 
-    const conversation = await getOrCreateConversation(userPhoneNumber);
+    // **📌 Guardar mensaje en la base de datos**
     await prisma.userMessage.create({
       data: {
         conversationId: conversation.id,
@@ -361,6 +390,7 @@ const chatHandler = async (req, res, next) => {
       },
     });
 
+    // **📌 Enviar mensaje al modelo de OpenAI**
     await openai.beta.threads.messages.create(conversation.threadId, {
       role: "user",
       content: finalMessageForAI,
@@ -373,6 +403,7 @@ const chatHandler = async (req, res, next) => {
     run = await handleRun(conversation.threadId, run.id);
 
     if (run.status === "completed") {
+      // **📌 Extraer y guardar respuesta del chatbot**
       const threadMessages = await openai.beta.threads.messages.list(conversation.threadId);
       const aiMessage = extractAssistantMessage(threadMessages);
 
@@ -384,13 +415,14 @@ const chatHandler = async (req, res, next) => {
         },
       });
 
+      // **📌 Enviar respuesta al usuario**
       await sendWAHAMessage(userPhoneNumber, aiMessage);
-      console.log(`Respuesta enviada a ${userPhoneNumber}: ${aiMessage}`);
+      console.log(`✅ Respuesta enviada a ${userPhoneNumber}: ${aiMessage}`);
     }
 
     res.status(200).send("Mensaje recibido y en espera para procesar.");
   } catch (error) {
-    console.error("Error en el chatHandler:", error);
+    console.error("❌ Error en el chatHandler:", error);
     next(error);
   }
 };
@@ -645,6 +677,27 @@ chatbotRoutes.post('/label', async (req, res, next) => {
     next(error);
   }
 });
+
+chatbotRoutes.post("/send-message", async (req, res) => {
+  try {
+    const { phoneNumber, message, mediaUrl } = req.body;
+
+    if (!phoneNumber || !message) {
+      return res.status(400).json({ error: "Faltan datos en la solicitud." });
+    }
+
+    console.log(`📤 Enviando mensaje a ${phoneNumber}: ${message}`);
+
+    // Enviar el mensaje por WAHA
+    await sendWAHAMessage(phoneNumber, message, mediaUrl);
+
+    return res.status(200).json({ success: true, message: "Mensaje enviado correctamente." });
+  } catch (error) {
+    console.error("❌ Error al enviar mensaje:", error);
+    res.status(500).json({ error: "Error al enviar el mensaje." });
+  }
+});
+
 
 
 module.exports = {
