@@ -4,7 +4,7 @@ services:
   waha:
     image: devlikeapro/waha:latest
     ports:
-      - "8080:3000"  # WAHA se expone públicamente en Railway
+      - "8080:3000"  # Railway expone este puerto públicamente
     volumes:
       - waha-data:/app/data
     environment:
@@ -12,17 +12,6 @@ services:
       - WAHA_SESSION_NAME=default
       - WAHA_HTTP=true
       - TZ=America/Guatemala
-
-  server:
-    build:
-      context: .
-    ports:
-      - "8081:8080"  # Solo accesible dentro del contenedor
-    environment:
-      - DATABASE_URL=${DATABASE_URL}
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-    depends_on:
-      - waha
 
 volumes:
   waha-data:
