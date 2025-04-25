@@ -139,6 +139,6 @@ process.on('unhandledRejection', (reason, promise) => {
 const PORT = process.env.PORT || 4000;
 
 // Iniciar el servidor
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
     console.log(`El servidor está corriendo en el puerto ${PORT}`);
 });

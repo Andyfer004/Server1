@@ -1,4 +1,5 @@
 const express = require('express');
+
 const openai = require('./openai'); // API de OpenAI
 const ExcelJS = require("exceljs");
 const fs = require("fs");
@@ -14,7 +15,7 @@ const chatbotRoutes = express.Router();
 const prisma = new PrismaClient();
 
 // Se eliminó la dependencia de Twilio
-phoneNumber = "whatsapp:+50259120285";
+phoneNumber = "whatsapp:+50241080361";
 const PUBLIC_BASE_URL = "https://pretty-experts-hunt.loca.lt";
 
 // Configuración de Supabase
@@ -268,7 +269,7 @@ async function describeImage(imageUrl) {
     // Configurar headers básicos para descargar la imagen (sin autorización)
     const headers = {
       "User-Agent": "Mozilla/5.0",
-      "Accept": "image/*"
+      "Accept": "image/"
     };
 
     const imageResponse = await fetch(imageUrl, {
@@ -315,16 +316,13 @@ async function describeImage(imageUrl) {
 /**
  * Maneja la conversación del chatbot y guarda los mensajes en la base de datos.
  */
-const messageQueue = {}; // Cola para acumular mensajes por número de teléfono
+const messageQueue = {};
+const MESSAGE_DELAY_MS = 10000;
 
 const chatHandler = async (req, res, next) => {
   try {
-    console.log("DEBUG: req.body =", req.body);
-
     let data = req.body;
-    if (data.payload) {
-      data = data.payload;
-    }
+    if (data.payload) data = data.payload;
 
     const userMessage = data.Body || data.body || "";
     const userPhoneNumber = data.From || data.from || "";
@@ -334,99 +332,165 @@ const chatHandler = async (req, res, next) => {
       return res.status(400).json({ error: "Faltan datos en la solicitud." });
     }
 
-    console.log(`📨 Mensaje recibido de ${userPhoneNumber}: ${userMessage}`);
-
-    // **📌 Obtener la conversación y verificar si está pausada**
-    const conversation = await getOrCreateConversation(userPhoneNumber);
-
-    if (conversation.isPaused) {
-      console.log(`🚫 Automatización pausada para ${userPhoneNumber}. No se responderá automáticamente.`);
-
-      // Guardar el mensaje en la base de datos sin responder
-      await prisma.userMessage.create({
-        data: {
-          conversationId: conversation.id,
-          role: "user",
-          content: userMessage,
-        },
-      });
-
-      return res.status(200).json({
-        message: "La automatización está pausada. Mensaje almacenado, pero sin respuesta automática.",
-      });
+    if (!messageQueue[userPhoneNumber]) {
+      messageQueue[userPhoneNumber] = {
+        messages: [],
+        timeoutId: null,
+        mediaUrls: [],
+      };
     }
 
-    // **📌 Continuar con el procesamiento normal si la automatización NO está pausada**
-    let finalMessageForAI = userMessage.trim();
-    let finalMessageForDB = userMessage.trim();
-    let mediaUrlForDB = null;
+    const queue = messageQueue[userPhoneNumber];
+    queue.messages.push(userMessage);
 
-    // **📌 Procesar imágenes si existen**
     if (numMedia > 0) {
-      let imageUrl = null;
-      if (data.media) {
-        imageUrl = typeof data.media === "object" ? data.media.url : data.media;
-      } else if (data.MediaUrl0) {
-        imageUrl = data.MediaUrl0;
-      }
-
-      if (imageUrl) {
-        console.log(`🖼️ Imagen detectada: ${imageUrl}`);
-        const imageDescription = await describeImage(imageUrl);
-        console.log(`📄 Descripción obtenida: ${imageDescription}`);
-        finalMessageForAI += `\n[Imagen adjunta] Descripción: ${imageDescription}`;
-        finalMessageForDB += `\nImagen recibida: ${imageUrl}`;
-        mediaUrlForDB = imageUrl;
-      }
+      let imageUrl = data.media?.url || data.MediaUrl0 || null;
+      if (imageUrl) queue.mediaUrls.push(imageUrl);
     }
 
-    // **📌 Guardar mensaje en la base de datos**
-    await prisma.userMessage.create({
-      data: {
-        conversationId: conversation.id,
-        role: "user",
-        content: finalMessageForDB,
-        mediaUrl: mediaUrlForDB,
-      },
-    });
+    if (queue.timeoutId) clearTimeout(queue.timeoutId);
 
-    // **📌 Enviar mensaje al modelo de OpenAI**
-    await openai.beta.threads.messages.create(conversation.threadId, {
+    queue.timeoutId = setTimeout(async () => {
+      try {
+        const conversation = await getOrCreateConversation(userPhoneNumber);
+        if (conversation.isPaused) return;
+
+        const combinedMessage = queue.messages.join("\n").trim();
+        let finalMessageForAI = combinedMessage;
+        let finalMessageForDB = combinedMessage;
+        let mediaUrlForDB = null;
+
+        if (queue.mediaUrls.length > 0) {
+          for (const imageUrl of queue.mediaUrls) {
+            const description = await describeImage(imageUrl);
+            finalMessageForAI += `\n[Imagen adjunta] Descripción: ${description}`;
+            finalMessageForDB += `\nImagen recibida: ${imageUrl}`;
+            mediaUrlForDB = imageUrl;
+          }
+        }
+
+        // Detectar intención del mensaje
+const aiResponse = await openai.chat.completions.create({
+  model: "gpt-3.5-turbo",
+  messages: [
+    {
+      role: "system",
+      content: "Eres un asistente que clasifica intenciones del usuario.",
+    },
+    {
       role: "user",
-      content: finalMessageForAI,
-    });
+      content: `Clasifica el siguiente mensaje en una de estas categorías:
+- "pedido_real": si incluye claramente nombre completo, producto, cantidad y opcionalmente NIT. Ejemplo: "Juan Pérez, NIT 123456, 2 camisetas".
+- "intención_de_pedido": si hay intención de comprar pero faltan datos como nombre o cantidad.
+- "consulta": si es una pregunta o búsqueda de información.
+- "otro": si no encaja con las anteriores.
 
-    let run = await openai.beta.threads.runs.create(conversation.threadId, {
-      assistant_id: "asst_UFGyAkWkTwdknKwF7PEsZOod",
-    });
+Mensaje del usuario: """${combinedMessage}"""
 
-    run = await handleRun(conversation.threadId, run.id);
+Responde únicamente con una palabra: pedido_real, intención_de_pedido, consulta u otro.`,
+    },
+  ],
+  temperature: 0,
+  max_tokens: 10,
+});
 
-    if (run.status === "completed") {
-      // **📌 Extraer y guardar respuesta del chatbot**
-      const threadMessages = await openai.beta.threads.messages.list(conversation.threadId);
-      const aiMessage = extractAssistantMessage(threadMessages);
+const intent = aiResponse.choices[0]?.message?.content?.trim().toLowerCase();
+console.log(`🎯 Intención detectada: ${intent}`);
 
-      await prisma.userMessage.create({
-        data: {
-          conversationId: conversation.id,
-          role: "assistant",
-          content: aiMessage,
-        },
-      });
+        // Guardar el mensaje en la base de datos
+        await prisma.userMessage.create({
+          data: {
+            conversationId: conversation.id,
+            role: "user",
+            content: finalMessageForDB,
+            mediaUrl: mediaUrlForDB,
+          },
+        });
 
-      // **📌 Enviar respuesta al usuario**
-      await sendWAHAMessage(userPhoneNumber, aiMessage);
-      console.log(`✅ Respuesta enviada a ${userPhoneNumber}: ${aiMessage}`);
-    }
+        // Procesar según la intención
+        if (intent === "intención_de_pedido") {
+          await sendWAHAMessage(
+            userPhoneNumber,
+            "¡Perfecto! Para procesar tu pedido, necesito:\n- Nombre y Apellido\n- NIT (opcional)\n- Producto\n- Cantidad\n\nPor favor, envíalos en un solo mensaje."
+          );
+        } else if (intent === "pedido_real") {
+          const aiOrder = await openai.chat.completions.create({
+            model: "gpt-4o-mini",
+            messages: [
+              {
+                role: "user",
+                content: `Extrae en formato JSON (sin explicaciones) el siguiente pedido:\nMensaje: \"${combinedMessage}\"\nDebe tener las claves: firstName, lastName, nit (opcional), product y quantity.`
+              }
+            ]
+          });
+
+          let content = aiOrder.choices[0].message.content;
+          content = content.replace(/```json\n?/, "").replace(/\n?```/, "").trim();
+
+          let orderData;
+          try {
+            orderData = JSON.parse(content);
+          } catch (parseError) {
+            return await sendWAHAMessage(userPhoneNumber, "No pude entender tu pedido. Asegúrate de enviarlo en el formato correcto.");
+          }
+
+          if (!orderData.firstName || !orderData.lastName || !orderData.product || !orderData.quantity) {
+            return await sendWAHAMessage(userPhoneNumber, "Faltan datos en el pedido. Por favor incluye nombre, producto y cantidad.");
+          }
+
+          await prisma.order.create({
+            data: {
+              phoneNumber: userPhoneNumber,
+              name: orderData.firstName,
+              lastName: orderData.lastName,
+              nit: orderData.nit || null,
+              product: orderData.product,
+              quantity: parseInt(orderData.quantity, 10)
+            },
+          });
+
+          await sendWAHAMessage(userPhoneNumber, `✅ Pedido registrado:\n👤 Cliente: ${orderData.firstName} ${orderData.lastName}\n📌 Producto: ${orderData.product}\n🔢 Cantidad: ${orderData.quantity}`);
+
+        } else {
+          await openai.beta.threads.messages.create(conversation.threadId, {
+            role: "user",
+            content: finalMessageForAI,
+          });
+
+          let run = await openai.beta.threads.runs.create(conversation.threadId, {
+            assistant_id: "asst_UFGyAkWkTwdknKwF7PEsZOod",
+          });
+
+          run = await handleRun(conversation.threadId, run.id);
+
+          if (run.status === "completed") {
+            const threadMessages = await openai.beta.threads.messages.list(conversation.threadId);
+            const aiMessage = extractAssistantMessage(threadMessages);
+
+            await prisma.userMessage.create({
+              data: {
+                conversationId: conversation.id,
+                role: "assistant",
+                content: aiMessage,
+              },
+            });
+
+            await sendWAHAMessage(userPhoneNumber, aiMessage);
+          }
+        }
+
+        delete messageQueue[userPhoneNumber];
+      } catch (err) {
+        console.error("❌ Error procesando cola de mensajes:", err);
+      }
+    }, MESSAGE_DELAY_MS);
 
     res.status(200).send("Mensaje recibido y en espera para procesar.");
   } catch (error) {
-    console.error("❌ Error en el chatHandler:", error);
+    console.error("❌ Error general en chatHandler:", error);
     next(error);
   }
 };
-
 
 module.exports = {
   chatHandler,
