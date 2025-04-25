@@ -1,26 +1,28 @@
 version: '3.8'
 
 services:
-  waha:
-    image: devlikeapro/waha
-    container_name: waha
+  server:
+    build: 
+      context: .
     ports:
-      - "5002:5000"
-      - "3000:3000"
+      - "8080:8080"
     environment:
-      BASE_URL: http://44.193.210.104:4000/api/chatbot/chat
-      PUBLIC_URL: http://44.193.210.104:4000/
-      PORT: 5000
-      MEDIA_PATH: /app/public/files
+      - DATABASE_URL=${DATABASE_URL}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    depends_on:
+      - waha
+
+  waha:
+    image: devlikeapro/waha:latest
+    ports:
+      - "5002:3000"
     volumes:
       - waha-data:/app/data
-      - ./media:/app/public/files
+    environment:
+      - WAHA_PORT=3000
+      - WAHA_SESSION_NAME=default
+      - WAHA_HTTP=true
+      - TZ=America/Guatemala
 
 volumes:
   waha-data:
-
-
-# comandos para levantar
-#docker pull devlikeapro/waha:arm
-#docker tag devlikeapro/waha:arm devlikeapro/waha
-#docker-compose up -d

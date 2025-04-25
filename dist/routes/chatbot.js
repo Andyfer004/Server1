@@ -212,7 +212,7 @@ async function sendWAHAMessage(phoneNumber, message, mediaUrl = null) {
       };
     }
 
-    await axios.post("http://localhost:5002/api/sendText", payload, {
+    await axios.post("http://waha:3000/api/sendText", payload, {
       headers: {
         "Accept": "application/json",
         "Content-Type": "application/json",
